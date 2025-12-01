@@ -1,224 +1,170 @@
 # 🎯 WiHelper
 
-## 📋 项目概述
+基于深度学习的屏幕中心目标识别工具，支持实时推理与自动响应。
 
-WiHelper项目是一个简单的基于深度学习的游戏人物识别工具，它通过图像识别技术判断是否发现目标并通过提供的API发出相应的信息。项目包含了一整套从训练数据收集到模型训练和推理的整套流程框架可供定制。注意，WiHelper只对外提供API接口以输出响应信号，并不直接涉及具体的响应处理后的行为方式。
-
-## 🏗️ 系统架构
-
-项目的系统架构遵循一个标准化的机器学习工作流，包括：
-`数据收集 → 数据标注 → 模型训练 → 模型推理 → 提供信号`。
-
-## 📁 项目文件结构
+## 📁 项目结构
 
 ```
 WiHelper/
-├── 📊 数据处理
-│   ├── screenshot_collector.py    # 屏幕截图数据收集器
-│   └── select_helper.py          # 数据标注辅助工具
-│
-├── 🤖 模型训练
-│   ├── train_model.py            # CNN模型训练脚本
-│   ├── inference.py              # 模型推理脚本
-│   └── models/                   # 训练好的模型文件
-│
-├── 📦 配置与依赖
-│   ├── requirements.txt           # Python依赖包
-│   ├── activate_env.bat           # 环境激活脚本
-│   └── image/                     # 数据集目录
-│       ├── train/                 # 训练数据
-│       └── test/                  # 测试数据
-│
-└──── README.md                  # 项目说明
+├── wihelper.py              # 主程序 - 实时识别与自动响应
+├── screenshot_collector.py  # 数据收集 - 截图采集器
+├── select_helper.py         # 数据标注 - GUI标注工具
+├── train_model.py           # 模型训练 - CNN训练脚本
+├── inference.py             # 模型推理 - 单独测试脚本
+├── environment.yml          # Conda环境配置
+├── image/                   # 数据集目录
+│   ├── train/got/           # 训练集-有目标
+│   ├── train/nogot/         # 训练集-无目标
+│   ├── test/got/            # 测试集-有目标
+│   └── test/nogot/          # 测试集-无目标
+└── models/                  # 模型文件
+    ├── best_model.h5        # 最佳模型
+    └── best_model_savedmodel/  # SavedModel格式（自动生成）
 ```
 
-## 🚀 使用流程
+## 🚀 快速开始
 
-### 阶段零：环境配置 ⚙️
+### 环境配置
 
-#### **依赖包更新**
-项目已添加AES内存加密功能，需要安装：
-- `cryptography>=42.0.0` - 用于AES加密/解密
-
-#### **环境激活**
 ```bash
-# 使用自动激活脚本
-activate_env.bat
+# 创建conda环境
+conda env create -f environment.yml
 
-# 或手动激活
+# 激活环境
 conda activate wihelper
 ```
 
-1. **激活conda环境**：
+### 运行主程序
 
-    ```bash
-    # 使用自动激活脚本（推荐）
-    activate_env.bat
-
-    # 或手动激活
-    conda activate wihelper
-    ```
-
-2. **验证环境**：
-
-    ```bash
-    activate_env.bat test
-    ```
-
-### 阶段一：数据收集 📸
-
-1.  **AES内存加密存储功能**：截图数据现在会先用AES加密存储在内存中，程序退出时统一写入磁盘，避免实时文件I/O检测。
-
-2.  激活环境并运行脚本：
-
-    ```bash
-    # 方法1：使用激活脚本
-    activate_env.bat run screenshot_collector.py
-
-    # 方法2：手动激活后运行
-    conda activate wihelper
-    python screenshot_collector.py
-    ```
-
-默认按鼠标右键即可截图，图片将自动保存到 `image/` 目录中。程序可在后台运行，无需保持程序窗口在前台。左ALT键可暂时取消截图。
-
-### 阶段二：数据标注 🏷️
-
-1.  激活环境并运行标注辅助工具：
-
-    ```bash
-    # 方法1：使用激活脚本
-    activate_env.bat run select_helper.py
-
-    # 方法2：手动激活后运行
-    conda activate wihelper
-    python select_helper.py
-    ```
-
-2.  使用键盘进行操作：
-
-    * **空格键**：标记为"无目标" (`notarget`)。
-    * **回车键**：标记为"有目标" (`target`)。
-
-### 阶段三：模型训练 🎓
-
-1.  **准备数据**：确保你已经使用 `select_helper.py` 标注了足够的数据。
-
-```
-WiHelper/
-├── image/
-│   ├── train/
-│   │   ├── got/     # 有目标的训练图片
-│   │   └── nogot/   # 无目标的训练图片
-│   └── test/
-│       ├── got/     # 有目标的测试图片
-│       └── nogot/   # 无目标的测试图片
-└── models/
+```bash
+python wihelper.py
 ```
 
-2.  **开始训练**：
+主程序启动后：
+- **右键点击**：进入瞄准模式（0.5秒瞄准 + 最长4秒检测窗口）
+- **检测到目标**：自动模拟按下 `P` 键
+- **双重检测机制**：连续两帧确认后才触发，减少误判
+- **Ctrl+C**：退出程序
 
-    ```bash
-    # 方法1：使用激活脚本
-    activate_env.bat run train_model.py
+## 📸 数据采集流程
 
-    # 方法2：手动激活后运行
-    conda activate wihelper
-    python train_model.py
-    ```
+### 1. 收集截图
 
-训练完成后，会在 `models/` 目录下生成 `best_model.h5`、`training_history.png`、`confusion_matrix.png` 和 `model_info.json` 等文件。
+```bash
+python screenshot_collector.py
+```
 
-### 阶段四：模型推理 🔍
+- **左键点击**：保存当前屏幕中心144×144区域截图
+- **左Alt+左键**：忽略本次点击（防误触）
+- **Ctrl+C**：退出并保存所有数据
 
-  * **单张图片测试**：
+截图会先AES加密存储在内存中，程序退出时统一写入 `image/` 目录。
 
-    ```bash
-    # 方法1：使用激活脚本
-    activate_env.bat run inference.py --image test.png
+### 2. 标注数据
 
-    # 方法2：手动激活后运行
-    conda activate wihelper
-    python inference.py --image test.png
-    ```
+```bash
+python select_helper.py
+```
 
-  * **批量预测测试**：
+GUI界面操作：
+- **空格键**：标记为无目标 → 移动到 `train/nogot/`
+- **回车键**：标记为有目标 → 移动到 `train/got/`
+- **Delete键**：删除低质量图片
+- **Ctrl+Z**：撤销操作（最多5步）
 
-    ```bash
-    activate_env.bat run inference.py --batch image/test/
-    ```
+### 3. 训练模型
 
-  * **推理速度测试**：
+```bash
+python train_model.py
+```
 
-    ```bash
-    activate_env.bat run inference.py --benchmark
-    ```
+训练时可选择三种模型架构：
+1. **平衡微调版**（默认）- 3 Block + Flatten，约2万特征
+2. **极简轻量版** - 4 Block + GAP，64维特征
+3. **加强版GAP** - 4 Block宽通道 + GAP，256维特征
 
+训练特性：
+- 学习率预热 + 余弦退火衰减
+- 梯度累积（等效batch_size=128）
+- 基于AUC的早停机制
+- 动态类别权重平衡
+
+### 后训练机制
+
+基础训练完成后，程序会询问是否进行后训练。后训练专门针对**难分类样本**（预测置信度在0.2-0.8之间）进行强化学习：
+
+- 每轮自动筛选测试集中的难分类样本
+- 使用恒定学习率 1e-4
+- 基于训练损失判断最佳模型
+- 每轮结束后可选择继续或停止
+- 难分类样本归零时自动结束
+
+输出文件：
+- `models/best_model.h5` - 最佳模型
+- `models/final_model.h5` - 最终模型
+- `models/info.txt` - 完整训练报告
+- `models/confusion_matrix.png` - 混淆矩阵图
+
+### 4. 测试推理
+
+```bash
+# 单张图片
+python inference.py --image test.png
+
+# 批量测试
+python inference.py --batch image/test/
+
+# 速度基准测试
+python inference.py --benchmark
+
+# 指定模型和阈值
+python inference.py --model models/best_model.h5 --threshold 0.8 --image test.png
+```
 
 ## ⚙️ 技术规格
 
-### AES内存加密系统
+| 项目 | 规格 |
+|------|------|
+| 输入尺寸 | 144×144×3 (RGB) |
+| 模型格式 | H5 / SavedModel |
+| 推理框架 | TensorFlow 2.x |
+| 检测阈值 | 0.5（可调） |
+| 推理延迟 | ~5-10ms/帧 |
 
-* **加密算法**：AES-256-CBC
-* **密钥管理**：程序运行时动态生成随机密钥
-* **存储方式**：内存缓冲区 + 延迟写入
-* **安全特性**：
-  - 随机IV（初始化向量）
-  - PKCS7填充
-  - 线程安全的缓冲区访问
-  - 程序退出时自动解密写入
+### 数据增强策略
 
-### 模型配置
+- 亮度调整 ±20%
+- 颜色通道偏移
+- 高斯噪声/模糊（30%概率）
+- **不使用几何变换**（保持准星位置精确）
 
-  * **输入尺寸**：144×144×3 (RGB)。
-  * **架构**：轻量级CNN，包含3个卷积块和2个全连接层。
-  * **参数量**：约 2.1M。
-  * **输出**：二分类概率 (0-1)。
+### 安全特性
 
-### 训练配置
+- AES-256-CBC 内存加密存储
+- 进程名/窗口标题伪装
+- 延迟批量写入磁盘
 
-  * **优化器**：Adam。
-  * **损失函数**：Binary Crossentropy。
-  * **数据增强**：支持缩放、水平翻转等增强方式。
-  * **批次大小**：32。
-  * **训练轮次**：50 (使用早停机制)。
+## 📊 数据集建议
 
-### 性能目标
+| 类型 | 数量 | 说明 |
+|------|------|------|
+| 训练集 | 400-1000张 | got/nogot各半 |
+| 测试集 | 100-200张 | got/nogot各半 |
+| 标注准确率 | >95% | 确保标签正确 |
 
-  * **目标准确率**：95%+。
-  * **推理速度**：10ms/张 (CPU)。
-  * **模型大小**：约 \~8MB。
+## 🔧 常见问题
 
-## 📊 数据集要求
+| 问题 | 解决方案 |
+|------|----------|
+| 模型文件不存在 | 先运行 `train_model.py` 训练模型 |
+| GPU未检测到 | 检查CUDA/cuDNN安装，或使用CPU推理 |
+| 截图保存失败 | 确保程序正常退出（Ctrl+C），触发磁盘写入 |
+| 推理速度慢 | 首次运行会自动转换为SavedModel格式加速 |
+| 误判率高 | 增加训练数据，或调高检测阈值 |
 
-### 推荐数据量
+## 📝 更新日志
 
-  * **训练集**：400-1000张 (各200-500张)。
-  * **测试集**：100-200张 (各50-100张)。
-  * **总计**：500-1200张图片。
-
-### 数据质量
-
-  * **分辨率**：144×144像素。
-  * **格式**：PNG (RGB，3通道)。
-  * **标注准确率**：95%+。
-  * **类别平衡**：有目标/无目标 ≈ 1:1。
-
-## 🔧 故障排除
-
-  * **AES加密相关问题**：
-    - 加密失败：检查cryptography库是否正确安装
-    - 解密失败：确保程序正常退出以保存数据
-    - 内存使用过高：监控内存缓冲区大小，可考虑定期清理
-
-  * **训练数据不足**：增加数据收集时间，或使用数据增强技术。
-  * **模型过拟合**：增加 Dropout 比例、使用早停机制或收集更多样化的数据。
-  * **推理速度慢**：可考虑使用 GPU 训练、优化模型架构或减小模型复杂度。
-  * **音频反馈不可用**：如果 `winsound` 音频功能不可用，程序会自动切换到视觉反馈。
-  * **内存不足**：减小批次大小或图片尺寸，注意AES加密会增加内存使用。
-
-## 🚀 未来扩展与改进
-
-  * **技术改进**：优化模型的结构设计，减少时延。优化截屏技术，压低风险和性能影响
-  * **外设功能**: 尝试硬件级的识别技术或更人性化的参数调节机制
-  
+- 主程序支持大狙/连狙双模式（通过 `fire_cooldown` 参数切换）
+- 双重检测机制减少误触发
+- SavedModel自动转换加速推理
+- 后训练功能针对难分类样本优化

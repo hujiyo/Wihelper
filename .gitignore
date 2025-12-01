@@ -1,6 +1,8 @@
 models-*/
+models/
 *.png
 *.bat
 __pycache__/
 .vs/
 *-plus.py
+log

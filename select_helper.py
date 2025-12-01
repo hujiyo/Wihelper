@@ -5,7 +5,8 @@
 - 逐个显示图片
 - 空格键：无目标 (nogot)
 - 回车键：有目标 (got)
-- Ctrl+Z：回退上一次标注 (最多3次)
+- Delete键：删除图片（质量不高）
+- Ctrl+Z：回退上一次操作 (最多5步，包括删除操作)
 - 自动移动文件到训练集对应文件夹
 - 简单直接：有文件就处理，没文件就结束
 """
@@ -45,12 +46,13 @@ class SelectHelper:
         self.stats = {
             "train_target": 0,
             "train_notarget": 0,
+            "deleted": 0,
             "total_processed": 0
         }
 
         # 回退功能
-        self.undo_stack = []  # 存储最近的操作，最多3个
-        self.max_undo = 3
+        self.undo_stack = []  # 存储最近的操作，最多5个
+        self.max_undo = 5
 
         # GUI相关
         self.root = None
@@ -116,7 +118,8 @@ class SelectHelper:
 操作说明：
 • 空格键：没中 (notarget)
 • 回车键：中了 (target)
-• Ctrl+Z：回退上一次标注 (最多3次)
+• Delete键：删除图片（质量不高）
+• Ctrl+Z：回退上一次操作 (最多5步)
 • Ctrl+C：退出程序
 
 标注模式：训练集
@@ -127,6 +130,7 @@ class SelectHelper:
         # 绑定键盘事件
         self.root.bind('<space>', lambda e: self.annotate_image(False))
         self.root.bind('<Return>', lambda e: self.annotate_image(True))
+        self.root.bind('<Delete>', lambda e: self.delete_image())
         self.root.bind('<Control-z>', lambda e: self.undo_last_annotation())
 
         # 设置窗口关闭事件
@@ -136,7 +140,7 @@ class SelectHelper:
         """更新信息显示"""
         if self.info_label:
             info_text = f"""进度：{self.current_index}/{len(self.image_files)}
-训练集 - 有目标：{self.stats['train_target']} | 无目标：{self.stats['train_notarget']}
+训练集 - 有目标：{self.stats['train_target']} | 无目标：{self.stats['train_notarget']} | 已删除：{self.stats['deleted']}
 当前文件：{os.path.basename(self.image_files[self.current_index]) if self.current_index < len(self.image_files) else 'N/A'}"""
             self.info_label.config(text=info_text)
 
@@ -206,6 +210,7 @@ class SelectHelper:
 
             # 记录操作到回退栈
             operation = {
+                'type': 'annotate',
                 'filename': filename,
                 'source_path': current_file,
                 'target_path': target_path,
@@ -241,8 +246,72 @@ class SelectHelper:
 
         self.update_info()
 
+    def delete_image(self):
+        """删除当前图片"""
+        if self.current_index >= len(self.image_files):
+            print("🎉 所有图片已标注完成！")
+            self.quit_program()
+            return
+
+        current_file = self.image_files[self.current_index]
+        filename = os.path.basename(current_file)
+
+        # 创建回收站文件夹（用于临时存储删除的文件，支持回退）
+        recycle_dir = os.path.join(self.target_base, ".recycle")
+        if not os.path.exists(recycle_dir):
+            os.makedirs(recycle_dir, exist_ok=True)
+
+        try:
+            # 移动文件到回收站而不是直接删除
+            recycle_path = os.path.join(recycle_dir, filename)
+            
+            # 如果回收站中已存在同名文件，添加时间戳
+            if os.path.exists(recycle_path):
+                import time
+                name, ext = os.path.splitext(filename)
+                timestamp = int(time.time() * 1000)
+                recycle_path = os.path.join(recycle_dir, f"{name}_{timestamp}{ext}")
+            
+            shutil.move(current_file, recycle_path)
+
+            # 记录操作到回退栈（删除操作现在可以回退）
+            operation = {
+                'type': 'delete',
+                'filename': filename,
+                'source_path': current_file,
+                'recycle_path': recycle_path,
+            }
+            self.undo_stack.append(operation)
+
+            # 保持回退栈大小
+            if len(self.undo_stack) > self.max_undo:
+                self.undo_stack.pop(0)
+
+            # 更新统计
+            self.stats['deleted'] += 1
+            self.stats['total_processed'] += 1
+
+            print(f"🗑️ 已删除: {filename}")
+
+        except Exception as e:
+            print(f"❌ 删除文件失败: {e}")
+            return
+
+        # 移动到下一张
+        self.current_index += 1
+
+        # 显示下一张图片
+        if self.current_index < len(self.image_files):
+            self.load_image(self.image_files[self.current_index])
+        else:
+            print("🎉 所有图片已标注完成！")
+            self.quit_program()
+            return
+
+        self.update_info()
+
     def undo_last_annotation(self):
-        """回退上一次标注"""
+        """回退上一次操作"""
         if not self.undo_stack:
             print("ℹ️ 没有可回退的操作")
             return
@@ -251,18 +320,30 @@ class SelectHelper:
         last_operation = self.undo_stack.pop()
 
         try:
-            # 将文件移回源文件夹
-            shutil.move(last_operation['target_path'], last_operation['source_path'])
+            # 检查操作类型
+            if last_operation['type'] == 'delete':
+                # 回退删除操作：从回收站恢复文件
+                shutil.move(last_operation['recycle_path'], last_operation['source_path'])
+                
+                # 调整统计信息
+                self.stats['deleted'] -= 1
+                self.stats['total_processed'] -= 1
+                
+                print(f"↩️ 已恢复删除: {last_operation['filename']}")
+                
+            elif last_operation['type'] == 'annotate':
+                # 回退标注操作：将文件移回源文件夹
+                shutil.move(last_operation['target_path'], last_operation['source_path'])
 
-            # 调整统计信息
-            self.stats[last_operation['stat_key']] -= 1
-            self.stats["total_processed"] -= 1
+                # 调整统计信息
+                self.stats[last_operation['stat_key']] -= 1
+                self.stats["total_processed"] -= 1
+
+                print(f"↩️ 已回退标注: {last_operation['filename']}")
 
             # 调整当前索引
             if self.current_index > 0:
                 self.current_index -= 1
-
-            print(f"↩️ 已回退: {last_operation['filename']}")
 
             # 重新显示当前图片
             if self.current_index < len(self.image_files):
@@ -279,6 +360,7 @@ class SelectHelper:
         print("\n" + "="*50)
         print("📊 标注统计：")
         print(f"训练集 - 有目标：{self.stats['train_target']} | 无目标：{self.stats['train_notarget']}")
+        print(f"已删除：{self.stats['deleted']} 张")
         print(f"总计处理：{self.stats['total_processed']} 张图片")
         print("="*50)
 
@@ -294,7 +376,8 @@ class SelectHelper:
         print("操作说明：")
         print("• 空格键：无目标 (nogot)")
         print("• 回车键：有目标 (got)")
-        print("• Ctrl+Z：回退上一次标注 (最多3次)")
+        print("• Delete键：删除图片（质量不高）")
+        print("• Ctrl+Z：回退上一次操作 (最多5步)")
         print("• Ctrl+C：退出程序")
         print("="*60)
 

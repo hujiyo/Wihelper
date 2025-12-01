@@ -30,9 +30,12 @@ global_lock = threading.Lock()  # 全局变量保护锁
 if_exit_goal = 0  # 是否退出判断模式（1=退出，0=继续）
 if_dead = 0       # 是否已经被其他机关击落（1=已击落，0=未击落）
 
+# 双重检测机制变量已移除，改为单次直接响应
+current_result = 0   # 当前检测结果（1=开火，0=不开火）
+
 class OptimizedInferenceModule:
     """优化的推理模块，基于inference-plus.py - 使用SavedModel格式"""
-    def __init__(self, model_path="models-v0.8/best_model.h5", threshold=0.5):
+    def __init__(self, model_path="models-v1.0-1/best_model.h5", threshold=0.5):
         self.model_path = model_path
         self.threshold = threshold
         self.img_height = 144
@@ -174,15 +177,20 @@ class OptimizedInferenceModule:
             input_tensor = tf.constant(processed_image, dtype=tf.float32)
             prediction = self.inference_func(input_tensor)
             
-            # 提取概率值（SavedModel输出格式可能不同）
-            if 'output_0' in prediction:
-                probability = float(prediction['output_0'][0][0])
-            elif 'dense_1' in prediction:
-                probability = float(prediction['dense_1'][0][0])
-            else:
-                # 尝试获取第一个输出
+            # 提取概率值（自动兼容不同架构的输出层名称）
+            # SavedModel 输出格式根据模型架构不同可能是 output_0, dense, dense_1, dense_2 等
+            output_key = None
+            for key in prediction.keys():
+                # 优先查找包含 'dense' 或 'output' 的键
+                if 'dense' in key.lower() or 'output' in key.lower():
+                    output_key = key
+                    break
+            
+            # 如果没找到，使用第一个键
+            if output_key is None:
                 output_key = list(prediction.keys())[0]
-                probability = float(prediction[output_key][0][0])
+            
+            probability = float(prediction[output_key][0][0])
             
             return probability
         except Exception as e:
@@ -278,14 +286,20 @@ class ScreenshotInferenceThread(threading.Thread):
                         self._last_fps_time = current_time
 
                     # 根据推理结果设置全局变量（使用锁保护）
-                    global if_exit_goal
+                    global if_exit_goal, current_result
                     with global_lock:
                         old_value = if_exit_goal
+                        old_current = current_result
+                        
+                        # 直接更新当前结果，移除双重检测
+                        current_result = 1 if probability > 0.5 else 0
+                        
+                        # 保持原有的if_exit_goal逻辑（向后兼容）
                         if_exit_goal = 1 if probability > 0.5 else 0
 
                     # 调试信息：只在值改变时打印
-                    if if_exit_goal != old_value:
-                        print(f"🎯 推理结果更新: 概率={probability:.3f}, if_exit_goal={if_exit_goal}")
+                    if if_exit_goal != old_value or current_result != old_current:
+                        print(f"🎯 推理结果更新: 概率={probability:.3f}, current={current_result}, if_exit_goal={if_exit_goal}")
 
                     # 定期进行垃圾回收（每100次推理）
                     self._gc_counter += 1
@@ -293,12 +307,12 @@ class ScreenshotInferenceThread(threading.Thread):
                         gc.collect()
                         self._gc_counter = 0
 
-                    # 每轮增加5ms延迟，降低CPU占用率
-                    time.sleep(0.01)
+                    # 每轮增加1ms延迟，降低CPU占用率
+                    time.sleep(0.005)
 
                 except Exception as e:
                     print(f"截图推理线程出错: {e}")
-                    time.sleep(0.1)
+                    time.sleep(0.005)
                 finally:
                     # 确保资源被释放
                     if img is not None:
@@ -439,7 +453,7 @@ class RawInputMouseListener:
             # 消息循环
             while self.running:
                 win32gui.PumpWaitingMessages()
-                time.sleep(0.01)
+                time.sleep(0.005)
 
         except Exception as e:
             print(f"❌ 鼠标监听器初始化失败: {e}")
@@ -545,7 +559,7 @@ class FeedbackCollector:
 
 class WiHelper:
     """激光射蚊子助手主类"""
-    def __init__(self):
+    def __init__(self, fire_cooldown=4.0):
         self.judging_mode = False  # 判断模式状态
         self.judging_start_time = 0  # 判断模式开始时间
         self.right_mouse_pressed = False  # 右键按下状态
@@ -553,6 +567,9 @@ class WiHelper:
         self.judging_thread = None  # 判断模式线程
         self.judging_lock = threading.Lock()  # 判断模式状态锁
         self.mouse_listener = RawInputMouseListener(self.on_mouse_click)
+        
+        # 开枪延迟设置（每一枪之间的时间间隔）
+        self.fire_cooldown = fire_cooldown
 
         # 初始化推理模块
         self.inference_module = OptimizedInferenceModule()
@@ -607,8 +624,8 @@ class WiHelper:
             print(f"❌ 鼠标事件处理出错: {e}")
 
     def enter_judging_mode_sync(self):
-        """同步进入判断模式（在当前线程中执行）"""
-        global if_dead, if_exit_goal, global_lock
+        """同步进入判断模式（在当前线程中执行）- 支持最多8枪"""
+        global if_dead, if_exit_goal, current_result, global_lock
 
         with global_lock:
             if if_dead == 1:
@@ -627,6 +644,12 @@ class WiHelper:
         aiming_time = 0.5  # 炮台瞄准时间
         total_timeout = 4.0  # 总超时时间
         start_time = time.time()
+        
+        # 开火计数器
+        fire_count = 0
+        max_fire_count = 8
+        last_fire_time = 0
+        fire_cooldown = self.fire_cooldown  # 使用用户设置的开火冷却时间
 
         try:
             # 第一阶段：0.5秒炮台瞄准时间，只检测退出条件，不开火
@@ -651,38 +674,58 @@ class WiHelper:
                 if current_time - self._last_debug_time > 0.1:
                     with global_lock:
                         current_if_exit_goal = if_exit_goal
-                    print(f"🔍 炮台瞄准中... if_exit_goal={current_if_exit_goal}, 经过时间={current_time - start_time:.1f}s")
+                        current_current_result = current_result
+                    print(f"🔍 炮台瞄准中... current={current_current_result}, if_exit_goal={current_if_exit_goal}, 经过时间={current_time - start_time:.1f}s")
                     self._last_debug_time = current_time
 
-                time.sleep(0.01)  # 小延迟避免CPU占用过高
+                time.sleep(0.005)  # 小延迟避免CPU占用过高
 
-            # 第二阶段：继续等待直到3秒超时，但仍然实时检测
+            # 第二阶段：继续等待直到超时，支持最多8枪
             while time.time() - start_time < total_timeout:
                 # 检查瞄准模式是否被外部退出（非阻塞检查）
                 if not self.judging_mode:
-                    print("🖱️ 瞄准模式被外部退出")
+                    print(f"🖱️ 瞄准模式被外部退出 (已开火{fire_count}枪)")
                     return
 
                 # 检查退出条件
                 if (self.left_mouse_pressed and not initial_left_pressed) or \
                    (self.right_mouse_pressed and not initial_right_pressed):
-                    print("🖱️ 检测到瞄准期间的鼠标点击，退出瞄准模式")
+                    print(f"🖱️ 检测到瞄准期间的鼠标点击，退出瞄准模式 (已开火{fire_count}枪)")
                     self.exit_judging_mode()
                     return
 
-                # 实时检查目标
+                # 实时检查目标 - 移除双重检测，直接响应
                 with global_lock:
                     current_if_exit_goal = if_exit_goal
-                if current_if_exit_goal == 1:
-                    print("🎯 检测到目标，开火！")
-                    self.fire_laser()
-                    self.exit_judging_mode()
-                    return
+                    current_current_result = current_result
+                
+                current_time = time.time()
+                
+                # 只要当前结果是开火状态就立即开火
+                if current_current_result == 1:
+                    # 检查是否在冷却时间内
+                    if current_time - last_fire_time >= fire_cooldown:
+                        fire_count += 1
+                        print(f"🎯 检测到目标，立即开火！(第{fire_count}/{max_fire_count}枪)")
+                        self.fire_laser()
+                        last_fire_time = current_time
+                        
+                        # 检查是否达到最大开火次数，或者在大狙模式下（延迟>=4s）开一枪就退出
+                        is_sniper_mode = self.fire_cooldown >= 4.0
+                        if fire_count >= max_fire_count or is_sniper_mode:
+                            reason = f"达到最大开火次数({max_fire_count}枪)" if not is_sniper_mode else "大狙模式单发命中"
+                            print(f"✅ {reason}，退出瞄准模式")
+                            self.exit_judging_mode()
+                            return
+                    # else: 在冷却时间内，不打印信息，继续等待
 
-                time.sleep(0.01)  # 小延迟避免CPU占用过高
+                time.sleep(0.005)  # 小延迟避免CPU占用过高
 
-            # 超时未检测到目标
-            print("❌ 判断超时，未检测到有效目标")
+            # 超时未检测到目标或未达到最大开火次数
+            if fire_count > 0:
+                print(f"⏱️ 判断超时，共开火{fire_count}枪")
+            else:
+                print("❌ 判断超时，未检测到有效目标")
             self.exit_judging_mode()
         finally:
             # 确保退出判断模式
@@ -696,31 +739,29 @@ class WiHelper:
             print("🏁 退出判断模式")
 
     def fire_laser(self):
-        """开火 - 模拟键盘敲击P并播放音乐，同时收集反馈数据"""
+        """开火 - 模拟键盘敲击P，同时收集反馈数据（仅大狙模式）"""
         keyboard = None
         try:
-            # 收集反馈数据 - 获取当前截图和推理概率
-            current_screenshot = self.screenshot_thread.get_current_screenshot()
-            if current_screenshot is not None:
-                # 重新进行推理获取准确概率（而不是使用二值化的if_exit_goal）
-                current_probability = self.inference_module.predict_from_pil_image(current_screenshot)
-                
-                # 收集反馈数据
-                self.feedback_collector.collect_feedback_image(current_screenshot, current_probability)
-                print(f"📊 已收集反馈数据，概率: {current_probability:.3f}")
-            else:
-                print("⚠️ 无法获取当前截图，跳过反馈数据收集")
+            # 只在大狙模式（延迟>=4秒）时收集反馈数据
+            if self.fire_cooldown >= 4.0:
+                current_screenshot = self.screenshot_thread.get_current_screenshot()
+                if current_screenshot is not None:
+                    # 重新进行推理获取准确概率（而不是使用二值化的if_exit_goal）
+                    current_probability = self.inference_module.predict_from_pil_image(current_screenshot)
+                    
+                    # 收集反馈数据
+                    self.feedback_collector.collect_feedback_image(current_screenshot, current_probability)
+                    print(f"📊 已收集反馈数据，概率: {current_probability:.3f}")
+                else:
+                    print("⚠️ 无法获取当前截图，跳过反馈数据收集")
+            # else: 连狙模式不保存图片，静默跳过
             
             # 使用pynput模拟键盘敲击P
             keyboard = KeyboardController()
             keyboard.press('p')
             keyboard.release('p')
 
-            # 播放开火音乐
-            self.play_fire_sound()
             print("💥 激光发射成功！")
-            # 确保退出判断模式
-            self.exit_judging_mode()
 
         except Exception as e:
             print(f"❌ 开火失败: {e}")
@@ -739,9 +780,15 @@ class WiHelper:
     def run(self):
         """主循环"""
         print("🚀 WiHelper激光射蚊子助手启动")
-        print("右键点击进入判断模式")
-        print("每次开火时会自动收集反馈数据并立即保存到image文件夹")
-        print("按Ctrl+C退出")
+        print(f"⏱️  当前开枪延迟设置: {self.fire_cooldown}秒")
+        if self.fire_cooldown >= 4.0:
+            print("📍 模式: 大狙模式（单发精确射击，4秒延迟相当于一枪后自动退出）")
+            print("💾 反馈数据: 每次开火时会自动保存截图到image文件夹")
+        else:
+            print(f"📍 模式: 连狙模式（{self.fire_cooldown}秒延迟，4秒内最多8枪）")
+            print("💾 反馈数据: 连狙模式不保存截图")
+        print("🖱️  右键点击进入判断模式")
+        print("⌨️  按Ctrl+C退出")
 
         try:
             # 主线程只负责监听鼠标事件，不再阻塞
@@ -752,7 +799,7 @@ class WiHelper:
                     gc.collect()
                     self._memory_check_counter = 0
                 
-                time.sleep(0.1)  # 定期检查监听器状态
+                time.sleep(1)
 
         except KeyboardInterrupt:
             print("\n👋 用户中断")
@@ -790,8 +837,54 @@ class WiHelper:
         print("✅ 清理完成")
 
 def main():
+    """主函数 - 提示用户输入开枪延迟设置"""
+    print("=" * 60)
+    print("🎯 WiHelper激光射蚊子助手 - 启动配置")
+    print("=" * 60)
+    print()
+    print("请设置开枪延迟时间（每一枪之间的时间间隔）：")
+    print("  - 直接按回车: 使用默认4秒（大狙模式，一枪后自动退出瞄准）")
+    print("  - 输入数字: 自定义延迟时间（例如：0.2 表示每0.2秒一枪，连狙模式）")
+    print()
+    print("💡 说明:")
+    print("  - 延迟 >= 4秒: 大狙模式，第一枪后因为延迟长会超时退出")
+    print("  - 延迟 < 4秒: 连狙模式，4秒内最多连续射击8枪")
+    print()
+    
+    fire_cooldown = 4.0  # 默认值
+    
+    try:
+        user_input = input("请输入延迟时间（秒）或直接回车使用默认值: ").strip()
+        
+        if user_input == "":
+            print(f"✓ 使用默认延迟: {fire_cooldown}秒（大狙模式）")
+        else:
+            try:
+                fire_cooldown = float(user_input)
+                if fire_cooldown <= 0:
+                    print("⚠️ 延迟时间必须大于0，使用默认值4秒")
+                    fire_cooldown = 4.0
+                elif fire_cooldown > 10:
+                    print("⚠️ 延迟时间过长（>10秒），使用默认值4秒")
+                    fire_cooldown = 4.0
+                else:
+                    if fire_cooldown >= 4.0:
+                        print(f"✓ 已设置延迟: {fire_cooldown}秒（大狙模式）")
+                    else:
+                        print(f"✓ 已设置延迟: {fire_cooldown}秒（连狙模式）")
+            except ValueError:
+                print("⚠️ 输入格式错误，使用默认值4秒")
+                fire_cooldown = 4.0
+    except Exception as e:
+        print(f"⚠️ 输入错误: {e}，使用默认值4秒")
+        fire_cooldown = 4.0
+    
+    print()
+    print("=" * 60)
+    print()
+    
     # 创建WiHelper实例并运行
-    helper = WiHelper()
+    helper = WiHelper(fire_cooldown=fire_cooldown)
     helper.run()
 
 if __name__ == "__main__":
