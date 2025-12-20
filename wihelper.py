@@ -21,7 +21,7 @@ import ctypes
 import uuid
 import ctypes.wintypes as wintypes
 import winsound
-from pynput.keyboard import Controller as KeyboardController
+from pynput.keyboard import Controller as KeyboardController, Listener as KeyboardListener, Key
 import gc
 from datetime import datetime
 
@@ -35,11 +35,20 @@ current_result = 0   # 当前检测结果（1=开火，0=不开火）
 
 class OptimizedInferenceModule:
     """优化的推理模块，基于inference-plus.py - 使用SavedModel格式"""
-    def __init__(self, model_path="models-v1.0-1/best_model.h5", threshold=0.5):
+    def __init__(self, model_path="models-v1.1-4/best_model.h5", threshold=0.4):
         self.model_path = model_path
         self.threshold = threshold
-        self.img_height = 144
-        self.img_width = 144
+        
+        # 检查是否为方案4模型
+        self.is_v4_model = "models-v1.0-4" in model_path
+        
+        # 实际截图尺寸：方案4为120，其他为144
+        self.capture_size = 120 if self.is_v4_model else 144
+        self.img_height = self.capture_size
+        self.img_width = self.capture_size
+        
+        if self.is_v4_model:
+            print(f"🚀 激活方案4性能优化: 截图尺寸缩小至 {self.capture_size}x{self.capture_size}, 将重构模型移除裁剪层")
 
         # 设置随机种子保证可重现性（与train_model保持一致）
         np.random.seed(42)
@@ -70,7 +79,8 @@ class OptimizedInferenceModule:
             # 生成SavedModel路径（与H5文件在同一目录）
             model_dir = os.path.dirname(self.model_path)
             model_name = os.path.splitext(os.path.basename(self.model_path))[0]
-            savedmodel_path = os.path.join(model_dir, f"{model_name}_savedmodel")
+            suffix = "_optimized" if self.is_v4_model else ""
+            savedmodel_path = os.path.join(model_dir, f"{model_name}_savedmodel{suffix}")
             
             # 检查SavedModel是否已存在
             if os.path.exists(savedmodel_path):
@@ -85,6 +95,36 @@ class OptimizedInferenceModule:
             
             # 第一步：加载H5模型
             h5_model = keras.models.load_model(self.model_path, compile=False)
+            
+            # 方案4专用优化：重构模型，移除CenterCrop层
+            if self.is_v4_model:
+                print("🛠️ 检测到方案4模型，正在移除CenterCrop层并重构输入...")
+                try:
+                    # 检查第一层是否为CenterCrop
+                    # 注意：Keras模型中InputLayer可能不计入layers列表，或者作为第一层
+                    start_layer_idx = 0
+                    if isinstance(h5_model.layers[0], keras.layers.InputLayer):
+                        start_layer_idx = 1
+                    
+                    first_layer = h5_model.layers[start_layer_idx]
+                    
+                    if "CenterCrop" in str(type(first_layer)) or "CenterCrop" in first_layer.__class__.__name__:
+                        # 创建新的Input (120x120)
+                        new_input = keras.Input(shape=(120, 120, 3))
+                        x = new_input
+                        
+                        # 重新连接 CenterCrop 之后的所有层
+                        # 跳过 CenterCrop 层
+                        for layer in h5_model.layers[start_layer_idx+1:]:
+                            x = layer(x)
+                            
+                        new_model = keras.Model(inputs=new_input, outputs=x)
+                        print("✅ 模型重构成功！新输入尺寸: 120x120, CenterCrop层已移除")
+                        h5_model = new_model
+                    else:
+                        print(f"⚠️ 警告：模型第一层不是CenterCrop ({type(first_layer)})，跳过重构")
+                except Exception as e:
+                    print(f"⚠️ 模型重构失败: {e}，将使用原始模型")
             
             # 第二步：转换为SavedModel格式并保存到同目录
             print("🔄 转换H5模型为SavedModel格式...")
@@ -224,8 +264,11 @@ class ScreenshotInferenceThread(threading.Thread):
         self._last_fps_time = time.time()
         self._fps_interval = 5.0  # 5秒打印一次帧率
 
-    def _precompute_capture_region(self, size=144):
+    def _precompute_capture_region(self):
         """预计算截图区域坐标"""
+        # 使用推理模块定义的截图尺寸
+        size = self.inference_module.capture_size
+        
         with mss.mss() as sct:
             monitor = sct.monitors[0]
             center_x = monitor["width"] // 2
@@ -308,11 +351,11 @@ class ScreenshotInferenceThread(threading.Thread):
                         self._gc_counter = 0
 
                     # 每轮增加1ms延迟，降低CPU占用率
-                    time.sleep(0.005)
+                    time.sleep(0.001)
 
                 except Exception as e:
                     print(f"截图推理线程出错: {e}")
-                    time.sleep(0.005)
+                    time.sleep(0.001)
                 finally:
                     # 确保资源被释放
                     if img is not None:
@@ -564,9 +607,14 @@ class WiHelper:
         self.judging_start_time = 0  # 判断模式开始时间
         self.right_mouse_pressed = False  # 右键按下状态
         self.left_mouse_pressed = False   # 左键按下状态
+        self.f_key_pressed = False        # F键按下状态（用于打断判断模式）
         self.judging_thread = None  # 判断模式线程
         self.judging_lock = threading.Lock()  # 判断模式状态锁
         self.mouse_listener = RawInputMouseListener(self.on_mouse_click)
+        
+        # 初始化键盘监听器（用于F键打断）
+        self.keyboard_listener = KeyboardListener(on_press=self.on_key_press)
+        self.keyboard_listener.start()
         
         # 开枪延迟设置（每一枪之间的时间间隔）
         self.fire_cooldown = fire_cooldown
@@ -590,6 +638,17 @@ class WiHelper:
 
         # 内存监控计数器
         self._memory_check_counter = 0
+
+    def on_key_press(self, key):
+        """键盘按键事件处理"""
+        try:
+            # 检查是否按下F键
+            if hasattr(key, 'char') and key.char == 'f':
+                if self.judging_mode:
+                    print("⌨️ F键按下：打断判断模式")
+                    self.f_key_pressed = True
+        except AttributeError:
+            pass  # 特殊键（如Shift、Ctrl等）没有char属性，忽略
 
     def on_mouse_click(self, button, pressed):
         """鼠标点击事件处理"""
@@ -616,10 +675,7 @@ class WiHelper:
                             print("🖱️ 右键点击：判断线程正在运行中")
             elif button == 'left':
                 self.left_mouse_pressed = pressed
-                if pressed and self.judging_mode:
-                    # 在判断模式中按左键，退出判断模式
-                    print("🖱️ 左键点击：退出判断模式")
-                    self.exit_judging_mode()
+                # 左键不再打断判断模式，改为F键打断
         except Exception as e:
             print(f"❌ 鼠标事件处理出错: {e}")
 
@@ -659,10 +715,11 @@ class WiHelper:
                     print("🖱️ 瞄准模式被外部退出")
                     return
 
-                # 检查退出条件：只有在判断期间新按下的鼠标键才算退出
-                if (self.left_mouse_pressed and not initial_left_pressed) or \
-                   (self.right_mouse_pressed and not initial_right_pressed):
-                    print("🖱️ 检测到瞄准期间的鼠标点击，退出瞄准模式")
+                # 检查退出条件：右键或F键打断
+                if (self.right_mouse_pressed and not initial_right_pressed) or self.f_key_pressed:
+                    reason = "F键" if self.f_key_pressed else "右键"
+                    print(f"🖱️ 检测到{reason}打断，退出瞄准模式")
+                    self.f_key_pressed = False  # 重置F键状态
                     self.exit_judging_mode()
                     return
 
@@ -687,10 +744,11 @@ class WiHelper:
                     print(f"🖱️ 瞄准模式被外部退出 (已开火{fire_count}枪)")
                     return
 
-                # 检查退出条件
-                if (self.left_mouse_pressed and not initial_left_pressed) or \
-                   (self.right_mouse_pressed and not initial_right_pressed):
-                    print(f"🖱️ 检测到瞄准期间的鼠标点击，退出瞄准模式 (已开火{fire_count}枪)")
+                # 检查退出条件：右键或F键打断
+                if (self.right_mouse_pressed and not initial_right_pressed) or self.f_key_pressed:
+                    reason = "F键" if self.f_key_pressed else "右键"
+                    print(f"🖱️ 检测到{reason}打断，退出瞄准模式 (已开火{fire_count}枪)")
+                    self.f_key_pressed = False  # 重置F键状态
                     self.exit_judging_mode()
                     return
 
@@ -788,7 +846,8 @@ class WiHelper:
             print(f"📍 模式: 连狙模式（{self.fire_cooldown}秒延迟，4秒内最多8枪）")
             print("💾 反馈数据: 连狙模式不保存截图")
         print("🖱️  右键点击进入判断模式")
-        print("⌨️  按Ctrl+C退出")
+        print("⌨️  按F键可打断判断模式（左键不会打断）")
+        print("⌨️  按Ctrl+C退出程序")
 
         try:
             # 主线程只负责监听鼠标事件，不再阻塞
@@ -824,6 +883,10 @@ class WiHelper:
         # 停止鼠标监听器
         if self.mouse_listener:
             self.mouse_listener.stop()
+
+        # 停止键盘监听器
+        if self.keyboard_listener:
+            self.keyboard_listener.stop()
 
         # 清理TensorFlow资源
         try:

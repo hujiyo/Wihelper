@@ -91,17 +91,21 @@ class WiHelperTrainer:
         print("\n" + "="*40)
         print("请选择模型架构方案:")
         print("  [1] 平衡微调版 - 3 Block, Flatten+Dense (推荐，默认)")
-        print("  [2] 预留位置 - 待添加")
-        print("  [3] 预留位置 - 待添加")
+        print("  [2] 位置敏感版 - 减少池化, 36×36分辨率")
+        print("  [3] 高效位置敏感版 - 深度可分离卷积, 快速推理")
+        print("  [4] 轻量极速版 - 120×120输入, 全链路加速")
         print("="*40)
         
-        choice = input("请输入方案编号 [1/2/3]: ").strip()
+        choice = input("请输入方案编号 [1/2/3/4]: ").strip()
         if choice == '2':
-            print("⚠️ 方案2暂未实现，使用默认方案1")
-            return self._create_model_v1()
+            print("✓ 已选择方案2: 位置敏感版")
+            return self._create_model_v2()
         elif choice == '3':
-            print("⚠️ 方案3暂未实现，使用默认方案1")
-            return self._create_model_v1()
+            print("✓ 已选择方案3: 高效位置敏感版")
+            return self._create_model_v3()
+        elif choice == '4':
+            print("✓ 已选择方案4: 轻量极速版 (120×120)")
+            return self._create_model_v4()
         else:
             if choice not in ['1', '']:
                 print(f"⚠️ 未知选项 '{choice}'，使用默认方案1")
@@ -153,14 +157,136 @@ class WiHelperTrainer:
         return model
 
     def _create_model_v2(self):
-        """方案2: 预留位置 - 待添加改进架构"""
-        # TODO: 添加改进的模型架构
-        raise NotImplementedError("方案2暂未实现")
+        """方案2: 位置敏感版 (减少池化，压缩全连接，保留更高空间分辨率)"""
+        model = keras.Sequential([
+            layers.Input(shape=(self.img_height, self.img_width, 3)),
+
+            # Block 1 (144 → 72)
+            layers.Conv2D(16, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.Conv2D(16, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.1),
+
+            # Block 2 (72 → 36)
+            layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.1),
+
+            # Block 3 (36 → 36) - 不池化，保留空间分辨率
+            layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.15),
+            
+            # 36×36×32 = 41,472
+            layers.Flatten(),
+
+            # 压缩全连接层 (41472 × 64 ≈ 265万参数，与方案1相当)
+            layers.Dense(64, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            
+            layers.Dense(1, activation='sigmoid')
+        ])
+        
+        model.compile(optimizer='adam',
+                     loss='binary_crossentropy',
+                     metrics=['accuracy', keras.metrics.AUC(name='auc')])
+        return model
 
     def _create_model_v3(self):
-        """方案3: 预留位置 - 待添加改进架构"""
-        # TODO: 添加改进的模型架构
-        raise NotImplementedError("方案3暂未实现")
+        """方案3: 高效位置敏感版 (深度可分离卷积 + 高分辨率 + 适中Dense)"""
+        model = keras.Sequential([
+            layers.Input(shape=(self.img_height, self.img_width, 3)),
+
+            # Block 1 (144 → 72) - 首层用标准卷积提取基础特征
+            layers.Conv2D(16, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.1),
+
+            # Block 2 (72 → 36) - 深度可分离卷积，大幅减少计算量
+            layers.SeparableConv2D(32, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.SeparableConv2D(32, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.1),
+
+            # Block 3 (36 → 36) - 不池化，保留空间分辨率
+            layers.SeparableConv2D(24, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.15),
+            
+            # 36×36×24 = 31,104
+            layers.Flatten(),
+
+            # 适中的Dense层 (31104 × 96 ≈ 298万参数)
+            layers.Dense(96, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            
+            layers.Dense(1, activation='sigmoid')
+        ])
+        
+        model.compile(optimizer='adam',
+                     loss='binary_crossentropy',
+                     metrics=['accuracy', keras.metrics.AUC(name='auc')])
+        return model
+
+    def _create_model_v4(self):
+        """方案4: 轻量极速版 (内部中心裁剪到120×120，基于方案1架构)"""
+        # 输入144×144 → 中心裁剪120×120 → 60×60 → 30×30 → 15×15
+        # Flatten: 15×15×64 = 14,400
+        model = keras.Sequential([
+            layers.Input(shape=(self.img_height, self.img_width, 3)),  # 仍接收144×144
+            
+            # 中心裁剪层: 144×144 → 120×120
+            layers.CenterCrop(120, 120),
+
+            # Block 1 (120 → 60)
+            layers.Conv2D(16, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.Conv2D(16, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.1),
+
+            # Block 2 (60 → 30)
+            layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.1),
+
+            # Block 3 (30 → 15)
+            layers.Conv2D(64, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.15),
+            
+            # 15×15×64 = 14,400
+            layers.Flatten(),
+
+            layers.Dense(128, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(64, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.2),
+            
+            layers.Dense(1, activation='sigmoid')
+        ])
+        
+        model.compile(optimizer='adam',
+                     loss='binary_crossentropy',
+                     metrics=['accuracy', keras.metrics.AUC(name='auc')])
+        return model
 
     def add_noise_and_blur(self, image):
         # 随机选择增强类型，30%的概率添加噪声，30%的概率添加模糊，40%的概率不添加
