@@ -24,6 +24,32 @@ import winsound
 from pynput.keyboard import Controller as KeyboardController, Listener as KeyboardListener, Key
 import gc
 from datetime import datetime
+from tensorflow.keras import layers
+
+
+# 自定义层：位置编码（用于 ViT 模型）
+class AddPositionalEmbedding(layers.Layer):
+    def __init__(self, num_patches, embedding_dim, **kwargs):
+        super().__init__(**kwargs)
+        self.num_patches = num_patches
+        self.embedding_dim = embedding_dim
+
+    def build(self, input_shape):
+        self.position_embedding = self.add_weight(
+            shape=(1, self.num_patches, self.embedding_dim),
+            initializer='glorot_uniform',
+            trainable=True,
+            name='position_embedding'
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        return inputs + self.position_embedding
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"num_patches": self.num_patches, "embedding_dim": self.embedding_dim})
+        return config
 
 # 全局变量及锁
 global_lock = threading.Lock()  # 全局变量保护锁
@@ -38,28 +64,26 @@ class OptimizedInferenceModule:
     def __init__(self, model_path="models-v1.1-4/best_model.h5", threshold=0.4):
         self.model_path = model_path
         self.threshold = threshold
-        
-        # 检查是否为方案4模型
-        self.is_v4_model = "models-v1.0-4" in model_path
-        
-        # 实际截图尺寸：方案4为120，其他为144
-        self.capture_size = 120 if self.is_v4_model else 144
-        self.img_height = self.capture_size
-        self.img_width = self.capture_size
-        
-        if self.is_v4_model:
-            print(f"🚀 激活方案4性能优化: 截图尺寸缩小至 {self.capture_size}x{self.capture_size}, 将重构模型移除裁剪层")
+
+        # 截图尺寸保持144×144
+        self.capture_size = 144
+        self.img_height = 144
+        self.img_width = 144
+
+        self.model_type = None  # 'cnn' 或 'vit'
+        self._output_key = None  # 缓存输出键名
+        print(f"🚀 加载模型: {model_path}")
 
         # 设置随机种子保证可重现性（与train_model保持一致）
         np.random.seed(42)
         tf.random.set_seed(42)
-        
+
         # 复用对象以减少内存分配 - 初始化为None
         self._reuse_processed_image = None
-        
+
         self._configure_optimizations() # 配置优化设置
         self.load_and_convert_model() # 加载并转换模型
-        self._warmup_model() # 预热模型 
+        self._warmup_model() # 预热模型
 
     def _configure_optimizations(self):
         """配置优化设置（与train_model保持一致）"""
@@ -75,13 +99,30 @@ class OptimizedInferenceModule:
             if not os.path.exists(self.model_path):
                 print(f"❌ 模型文件不存在: {self.model_path}")
                 sys.exit(1)
-            
+
             # 生成SavedModel路径（与H5文件在同一目录）
             model_dir = os.path.dirname(self.model_path)
             model_name = os.path.splitext(os.path.basename(self.model_path))[0]
-            suffix = "_optimized" if self.is_v4_model else ""
+
+            # 先检测模型类型（通过快速检查第一层）
+            self.model_type = 'unknown'
+            try:
+                h5_temp = keras.models.load_model(self.model_path, compile=False, custom_objects={'AddPositionalEmbedding': AddPositionalEmbedding})
+                start_layer_idx = 0
+                if isinstance(h5_temp.layers[0], keras.layers.InputLayer):
+                    start_layer_idx = 1
+                first_layer = h5_temp.layers[start_layer_idx]
+                first_layer_name = first_layer.name if hasattr(first_layer, 'name') else ''
+                if 'patch_embedding' in first_layer_name:
+                    self.model_type = 'vit'
+                del h5_temp
+            except:
+                pass
+
+            # 根据模型类型使用不同的 SavedModel 名称
+            suffix = "_vit" if self.model_type == 'vit' else "_cnn"
             savedmodel_path = os.path.join(model_dir, f"{model_name}_savedmodel{suffix}")
-            
+
             # 检查SavedModel是否已存在
             if os.path.exists(savedmodel_path):
                 print(f"📦 发现已存在的SavedModel: {savedmodel_path}")
@@ -89,63 +130,87 @@ class OptimizedInferenceModule:
                 self.model = tf.saved_model.load(savedmodel_path)
                 self.inference_func = self.model.signatures['serving_default']
                 print("✅ SavedModel加载完成！")
+                # 预先找到并缓存输出键名
+                self._cache_output_key()
                 return
-            
+
             print(f"📦 加载H5模型: {self.model_path}")
-            
+
             # 第一步：加载H5模型
-            h5_model = keras.models.load_model(self.model_path, compile=False)
-            
-            # 方案4专用优化：重构模型，移除CenterCrop层
-            if self.is_v4_model:
-                print("🛠️ 检测到方案4模型，正在移除CenterCrop层并重构输入...")
+            h5_model = keras.models.load_model(self.model_path, compile=False, custom_objects={'AddPositionalEmbedding': AddPositionalEmbedding})
+
+            # 检测模型类型并优化
+            start_layer_idx = 0
+            if isinstance(h5_model.layers[0], keras.layers.InputLayer):
+                start_layer_idx = 1
+
+            first_layer = h5_model.layers[start_layer_idx]
+            first_layer_name = first_layer.name if hasattr(first_layer, 'name') else ''
+            first_layer_type = type(first_layer).__name__
+
+            # 检测模型类型
+            if 'patch_embedding' in first_layer_name:
+                self.model_type = 'vit'
+                print("✅ 检测到 ViT 模型，无需重构")
+            elif "CenterCrop" in first_layer_type or "CenterCrop" in first_layer_name:
+                self.model_type = 'cnn'
+                # CNN模型：重构模型，移除CenterCrop层，直接使用120×120输入
+                print("🛠️ 检测到 CNN 模型，正在移除CenterCrop层并重构为120×120直接输入...")
                 try:
-                    # 检查第一层是否为CenterCrop
-                    # 注意：Keras模型中InputLayer可能不计入layers列表，或者作为第一层
-                    start_layer_idx = 0
-                    if isinstance(h5_model.layers[0], keras.layers.InputLayer):
-                        start_layer_idx = 1
-                    
-                    first_layer = h5_model.layers[start_layer_idx]
-                    
-                    if "CenterCrop" in str(type(first_layer)) or "CenterCrop" in first_layer.__class__.__name__:
-                        # 创建新的Input (120x120)
-                        new_input = keras.Input(shape=(120, 120, 3))
-                        x = new_input
-                        
-                        # 重新连接 CenterCrop 之后的所有层
-                        # 跳过 CenterCrop 层
-                        for layer in h5_model.layers[start_layer_idx+1:]:
-                            x = layer(x)
-                            
-                        new_model = keras.Model(inputs=new_input, outputs=x)
-                        print("✅ 模型重构成功！新输入尺寸: 120x120, CenterCrop层已移除")
-                        h5_model = new_model
-                    else:
-                        print(f"⚠️ 警告：模型第一层不是CenterCrop ({type(first_layer)})，跳过重构")
+                    # 创建新的Input (120x120)
+                    new_input = keras.Input(shape=(120, 120, 3))
+                    x = new_input
+
+                    # 重新连接 CenterCrop 之后的所有层
+                    for layer in h5_model.layers[start_layer_idx+1:]:
+                        x = layer(x)
+
+                    new_model = keras.Model(inputs=new_input, outputs=x)
+                    print("✅ CNN模型重构成功！新输入尺寸: 120x120, CenterCrop层已移除")
+                    h5_model = new_model
+                    # 更新推理时的图像尺寸
+                    self.img_height = 120
+                    self.img_width = 120
                 except Exception as e:
                     print(f"⚠️ 模型重构失败: {e}，将使用原始模型")
-            
+            else:
+                print(f"⚠️ 未知的模型结构，第一层: {first_layer_type} ({first_layer_name})")
+
             # 第二步：转换为SavedModel格式并保存到同目录
             print("🔄 转换H5模型为SavedModel格式...")
             h5_model.save(savedmodel_path, save_format='tf')
-            
+
             # 第三步：加载SavedModel进行推理
             print("📦 加载SavedModel进行推理...")
             self.model = tf.saved_model.load(savedmodel_path)
-            
+
             # 获取推理函数（SavedModel的默认签名）
             self.inference_func = self.model.signatures['serving_default']
-            
+
+            # 预先找到并缓存输出键名
+            self._cache_output_key()
+
             # 清理H5模型
             del h5_model
-            gc.collect()
-            
+
             print(f"✅ SavedModel转换和加载完成！已保存到: {savedmodel_path}")
 
         except Exception as e:
             print(f"❌ 模型转换失败: {e}")
             sys.exit(1)
+
+    def _cache_output_key(self):
+        """预先找到并缓存输出键名"""
+        # 用一次推理来找出输出键
+        dummy = tf.constant(np.random.rand(1, self.img_height, self.img_width, 3), dtype=tf.float32)
+        dummy_output = self.inference_func(dummy)
+        for key in dummy_output.keys():
+            if 'dense' in key.lower() or 'output' in key.lower():
+                self._output_key = key
+                break
+        if self._output_key is None:
+            self._output_key = list(dummy_output.keys())[0]
+        print(f"✓ 输出键名已缓存: {self._output_key}")
 
     def _warmup_model(self):
         """预热SavedModel"""
@@ -156,22 +221,20 @@ class OptimizedInferenceModule:
             for _ in range(3):
                 dummy_image = np.random.randint(0, 255, (self.img_height, self.img_width, 3), dtype=np.uint8)
                 processed = self._fast_preprocess(dummy_image)
-                
+
                 # 使用SavedModel进行推理预热
                 input_tensor = tf.constant(processed, dtype=tf.float32)
                 self.inference_func(input_tensor)
-                
+
                 # 清理临时变量
                 del dummy_image
                 dummy_image = None
-                gc.collect()  # 强制垃圾回收
         finally:
             # 确保清理资源
             if dummy_image is not None:
                 del dummy_image
             if processed is not None:
                 del processed
-            gc.collect()
         print("✓ SavedModel预热完成")
 
     def _fast_preprocess(self, image_array):
@@ -186,14 +249,14 @@ class OptimizedInferenceModule:
                 resized = cv2.resize(image_array, (self.img_width, self.img_height))
 
             img_array = resized.astype(np.float32) * (1.0/255.0)
-            
+
             # 复用处理后的图像数组以减少内存分配
             if self._reuse_processed_image is None:
                 self._reuse_processed_image = np.expand_dims(img_array, axis=0)
             else:
                 # 直接更新现有数组的数据
                 self._reuse_processed_image[0] = img_array
-            
+
             return self._reuse_processed_image
         finally:
             # 清理临时变量
@@ -203,48 +266,23 @@ class OptimizedInferenceModule:
                 del img_array
 
     def predict_from_pil_image(self, pil_image):
-        """从PIL图像进行SavedModel推理"""
-        image_array = None
-        processed_image = None
-        prediction = None
-        input_tensor = None
+        """从PIL图像进行SavedModel推理（优化版）"""
         try:
             # 将PIL图像转换为numpy数组
             image_array = np.array(pil_image)
             processed_image = self._fast_preprocess(image_array)
-            
+
             # 使用SavedModel进行推理
             input_tensor = tf.constant(processed_image, dtype=tf.float32)
             prediction = self.inference_func(input_tensor)
-            
-            # 提取概率值（自动兼容不同架构的输出层名称）
-            # SavedModel 输出格式根据模型架构不同可能是 output_0, dense, dense_1, dense_2 等
-            output_key = None
-            for key in prediction.keys():
-                # 优先查找包含 'dense' 或 'output' 的键
-                if 'dense' in key.lower() or 'output' in key.lower():
-                    output_key = key
-                    break
-            
-            # 如果没找到，使用第一个键
-            if output_key is None:
-                output_key = list(prediction.keys())[0]
-            
-            probability = float(prediction[output_key][0][0])
-            
+
+            # 使用缓存的键名直接获取概率值
+            probability = float(prediction[self._output_key][0][0])
+
             return probability
         except Exception as e:
             print(f"❌ SavedModel推理失败: {e}")
             return 0.0
-        finally:
-            # 显式清理临时变量
-            if image_array is not None:
-                del image_array
-            if prediction is not None:
-                del prediction
-            if input_tensor is not None:
-                del input_tensor
-            # 不删除processed_image因为它是复用的
 
 class ScreenshotInferenceThread(threading.Thread):
     """截图推理线程"""
@@ -292,7 +330,7 @@ class ScreenshotInferenceThread(threading.Thread):
             }
 
     def run(self):
-        """后台持续截图并推理"""
+        """后台持续截图并推理（性能优化版）"""
         sct = mss.mss()
 
         try:
@@ -302,19 +340,9 @@ class ScreenshotInferenceThread(threading.Thread):
                 try:
                     # 截取屏幕中心区域
                     screenshot = sct.grab(self.capture_region)
-                    
-                    # 每次都创建新的PIL图像，避免复用导致的问题
-                    img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
-                    # 使用锁保护current_screenshot
-                    with self.screenshot_lock:
-                        # 显式释放之前的图像对象以避免内存泄漏
-                        if self.current_screenshot is not None:
-                            try:
-                                self.current_screenshot.close()
-                            except:
-                                pass  # 忽略关闭错误
-                        self.current_screenshot = img.copy()  # 创建副本避免引用问题
+                    # 直接创建PIL图像用于推理
+                    img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
                     # 进行推理
                     probability = self.inference_module.predict_from_pil_image(img)
@@ -328,34 +356,23 @@ class ScreenshotInferenceThread(threading.Thread):
                         self._frame_count = 0
                         self._last_fps_time = current_time
 
-                    # 根据推理结果设置全局变量（使用锁保护）
+                    # 根据推理结果设置全局变量
                     global if_exit_goal, current_result
                     with global_lock:
                         old_value = if_exit_goal
                         old_current = current_result
-                        
-                        # 直接更新当前结果，移除双重检测
+
                         current_result = 1 if probability > 0.5 else 0
-                        
-                        # 保持原有的if_exit_goal逻辑（向后兼容）
                         if_exit_goal = 1 if probability > 0.5 else 0
 
                     # 调试信息：只在值改变时打印
                     if if_exit_goal != old_value or current_result != old_current:
                         print(f"🎯 推理结果更新: 概率={probability:.3f}, current={current_result}, if_exit_goal={if_exit_goal}")
-
-                    # 定期进行垃圾回收（每100次推理）
-                    self._gc_counter += 1
-                    if self._gc_counter >= 100:
-                        gc.collect()
-                        self._gc_counter = 0
-
-                    # 每轮增加1ms延迟，降低CPU占用率
+                    
                     time.sleep(0.001)
-
+                    
                 except Exception as e:
                     print(f"截图推理线程出错: {e}")
-                    time.sleep(0.001)
                 finally:
                     # 确保资源被释放
                     if img is not None:
@@ -365,7 +382,7 @@ class ScreenshotInferenceThread(threading.Thread):
                             pass
                     if screenshot is not None:
                         del screenshot
-                    
+
         finally:
             try:
                 sct.close()
