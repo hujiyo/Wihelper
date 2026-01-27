@@ -126,9 +126,15 @@ class OptimizedInferenceModule:
             # 检查SavedModel是否已存在
             if os.path.exists(savedmodel_path):
                 print(f"📦 发现已存在的SavedModel: {savedmodel_path}")
+                print(f"🔍 检测到模型类型: {self.model_type}")
                 print("📦 直接加载SavedModel进行推理...")
                 self.model = tf.saved_model.load(savedmodel_path)
                 self.inference_func = self.model.signatures['serving_default']
+                # 对于CNN模型，SavedModel使用120×120输入（已重构移除CenterCrop）
+                if self.model_type != 'vit':  # CNN或unknown模型都使用120×120
+                    self.img_height = 120
+                    self.img_width = 120
+                    print(f"📐 设置CNN输入尺寸: {self.img_height}×{self.img_width}")
                 print("✅ SavedModel加载完成！")
                 # 预先找到并缓存输出键名
                 self._cache_output_key()
