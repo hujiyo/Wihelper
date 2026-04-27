@@ -1,8 +1,6 @@
 import os
 import time
 import threading
-import random
-import base64
 from datetime import datetime
 from PIL import Image
 import mss
@@ -396,7 +394,7 @@ class ScreenshotCollector:
         except Exception as e:
             print(f"✗ UI语言设置失败: {e}")
 
-    def _precompute_capture_region(self, size=144):
+    def _precompute_capture_region(self, size=120):
         """预计算截图区域坐标，避免每次重新计算"""
         # 使用临时mss实例获取屏幕信息
         with mss.mss() as sct:
@@ -455,7 +453,7 @@ class ScreenshotCollector:
             if hasattr(sct, 'close'):
                 sct.close()
 
-    def capture_center_region_thread_safe(self, sct, size=144):
+    def capture_center_region_thread_safe(self, sct, size=120):
         """线程安全的截取屏幕中心指定大小的方形区域"""
         # 使用传入的mss实例和预计算的截图区域
         screenshot = sct.grab(self.capture_region)
@@ -465,7 +463,7 @@ class ScreenshotCollector:
 
         return img
 
-    def capture_center_region(self, size=144):
+    def capture_center_region(self, size=120):
         """截取屏幕中心指定大小的方形区域（兼容旧代码）"""
         # 创建临时的mss实例用于单次截图
         with mss.mss() as sct:
