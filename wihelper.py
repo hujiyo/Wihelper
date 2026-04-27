@@ -13,9 +13,7 @@ import threading
 import numpy as np
 from PIL import Image
 import mss
-import cv2
-import tensorflow as tf
-from tensorflow import keras
+import torch
 import win32gui
 import ctypes
 import uuid
@@ -24,270 +22,97 @@ import winsound
 from pynput.keyboard import Controller as KeyboardController, Listener as KeyboardListener, Key
 import gc
 from datetime import datetime
-from tensorflow.keras import layers
+from train_model import WiHelperCNN
 
-
-# 自定义层：位置编码（用于 ViT 模型）
-class AddPositionalEmbedding(layers.Layer):
-    def __init__(self, num_patches, embedding_dim, **kwargs):
-        super().__init__(**kwargs)
-        self.num_patches = num_patches
-        self.embedding_dim = embedding_dim
-
-    def build(self, input_shape):
-        self.position_embedding = self.add_weight(
-            shape=(1, self.num_patches, self.embedding_dim),
-            initializer='glorot_uniform',
-            trainable=True,
-            name='position_embedding'
-        )
-        super().build(input_shape)
-
-    def call(self, inputs):
-        return inputs + self.position_embedding
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({"num_patches": self.num_patches, "embedding_dim": self.embedding_dim})
-        return config
 
 # 全局变量及锁
-global_lock = threading.Lock()  # 全局变量保护锁
-if_exit_goal = 0  # 是否退出判断模式（1=退出，0=继续）
-if_dead = 0       # 是否已经被其他机关击落（1=已击落，0=未击落）
-
-# 双重检测机制变量已移除，改为单次直接响应
-current_result = 0   # 当前检测结果（1=开火，0=不开火）
+global_lock = threading.Lock()
+if_exit_goal = 0
+if_dead = 0
+current_result = 0
 
 class OptimizedInferenceModule:
-    """优化的推理模块，基于inference-plus.py - 使用SavedModel格式"""
-    def __init__(self, model_path="models-v1.1-4/best_model.h5", threshold=0.4):
+    """优化的推理模块 - 直接使用120×120输入"""
+    def __init__(self, model_path="models-v1.1-4/best_model.pth", threshold=0.5):
         self.model_path = model_path
         self.threshold = threshold
 
-        # 截图尺寸保持144×144
-        self.capture_size = 144
-        self.img_height = 144
-        self.img_width = 144
+        self.capture_size = 120
+        self.img_height = 120
+        self.img_width = 120
 
-        self.model_type = None  # 'cnn' 或 'vit'
-        self._output_key = None  # 缓存输出键名
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"🚀 加载模型: {model_path}")
+        print(f"   设备: {self.device}")
 
-        # 设置随机种子保证可重现性（与train_model保持一致）
         np.random.seed(42)
-        tf.random.set_seed(42)
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(42)
 
-        # 复用对象以减少内存分配 - 初始化为None
-        self._reuse_processed_image = None
+        self._reuse_buffer = None
+        self.load_model()
+        self._warmup_model()
 
-        self._configure_optimizations() # 配置优化设置
-        self.load_and_convert_model() # 加载并转换模型
-        self._warmup_model() # 预热模型
-
-    def _configure_optimizations(self):
-        """配置优化设置（与train_model保持一致）"""
-        # GPU内存动态分配配置（与train_model保持一致）
-        physical_devices = tf.config.list_physical_devices('GPU')
-        if physical_devices:
-            for device in physical_devices:
-                tf.config.experimental.set_memory_growth(device, True)
-
-    def load_and_convert_model(self):
-        """加载H5模型并转换为SavedModel格式进行推理"""
+    def load_model(self):
+        """加载模型"""
         try:
             if not os.path.exists(self.model_path):
                 print(f"❌ 模型文件不存在: {self.model_path}")
                 sys.exit(1)
 
-            # 生成SavedModel路径（与H5文件在同一目录）
-            model_dir = os.path.dirname(self.model_path)
-            model_name = os.path.splitext(os.path.basename(self.model_path))[0]
-
-            # 先检测模型类型（通过快速检查第一层）
-            self.model_type = 'unknown'
-            try:
-                h5_temp = keras.models.load_model(self.model_path, compile=False, custom_objects={'AddPositionalEmbedding': AddPositionalEmbedding})
-                start_layer_idx = 0
-                if isinstance(h5_temp.layers[0], keras.layers.InputLayer):
-                    start_layer_idx = 1
-                first_layer = h5_temp.layers[start_layer_idx]
-                first_layer_name = first_layer.name if hasattr(first_layer, 'name') else ''
-                if 'patch_embedding' in first_layer_name:
-                    self.model_type = 'vit'
-                del h5_temp
-            except:
-                pass
-
-            # 根据模型类型使用不同的 SavedModel 名称
-            suffix = "_vit" if self.model_type == 'vit' else "_cnn"
-            savedmodel_path = os.path.join(model_dir, f"{model_name}_savedmodel{suffix}")
-
-            # 检查SavedModel是否已存在
-            if os.path.exists(savedmodel_path):
-                print(f"📦 发现已存在的SavedModel: {savedmodel_path}")
-                print(f"🔍 检测到模型类型: {self.model_type}")
-                print("📦 直接加载SavedModel进行推理...")
-                self.model = tf.saved_model.load(savedmodel_path)
-                self.inference_func = self.model.signatures['serving_default']
-                # 对于CNN模型，SavedModel使用120×120输入（已重构移除CenterCrop）
-                if self.model_type != 'vit':  # CNN或unknown模型都使用120×120
-                    self.img_height = 120
-                    self.img_width = 120
-                    print(f"📐 设置CNN输入尺寸: {self.img_height}×{self.img_width}")
-                print("✅ SavedModel加载完成！")
-                # 预先找到并缓存输出键名
-                self._cache_output_key()
-                return
-
-            print(f"📦 加载H5模型: {self.model_path}")
-
-            # 第一步：加载H5模型
-            h5_model = keras.models.load_model(self.model_path, compile=False, custom_objects={'AddPositionalEmbedding': AddPositionalEmbedding})
-
-            # 检测模型类型并优化
-            start_layer_idx = 0
-            if isinstance(h5_model.layers[0], keras.layers.InputLayer):
-                start_layer_idx = 1
-
-            first_layer = h5_model.layers[start_layer_idx]
-            first_layer_name = first_layer.name if hasattr(first_layer, 'name') else ''
-            first_layer_type = type(first_layer).__name__
-
-            # 检测模型类型
-            if 'patch_embedding' in first_layer_name:
-                self.model_type = 'vit'
-                print("✅ 检测到 ViT 模型，无需重构")
-            elif "CenterCrop" in first_layer_type or "CenterCrop" in first_layer_name:
-                self.model_type = 'cnn'
-                # CNN模型：重构模型，移除CenterCrop层，直接使用120×120输入
-                print("🛠️ 检测到 CNN 模型，正在移除CenterCrop层并重构为120×120直接输入...")
-                try:
-                    # 创建新的Input (120x120)
-                    new_input = keras.Input(shape=(120, 120, 3))
-                    x = new_input
-
-                    # 重新连接 CenterCrop 之后的所有层
-                    for layer in h5_model.layers[start_layer_idx+1:]:
-                        x = layer(x)
-
-                    new_model = keras.Model(inputs=new_input, outputs=x)
-                    print("✅ CNN模型重构成功！新输入尺寸: 120x120, CenterCrop层已移除")
-                    h5_model = new_model
-                    # 更新推理时的图像尺寸
-                    self.img_height = 120
-                    self.img_width = 120
-                except Exception as e:
-                    print(f"⚠️ 模型重构失败: {e}，将使用原始模型")
-            else:
-                print(f"⚠️ 未知的模型结构，第一层: {first_layer_type} ({first_layer_name})")
-
-            # 第二步：转换为SavedModel格式并保存到同目录
-            print("🔄 转换H5模型为SavedModel格式...")
-            h5_model.save(savedmodel_path, save_format='tf')
-
-            # 第三步：加载SavedModel进行推理
-            print("📦 加载SavedModel进行推理...")
-            self.model = tf.saved_model.load(savedmodel_path)
-
-            # 获取推理函数（SavedModel的默认签名）
-            self.inference_func = self.model.signatures['serving_default']
-
-            # 预先找到并缓存输出键名
-            self._cache_output_key()
-
-            # 清理H5模型
-            del h5_model
-
-            print(f"✅ SavedModel转换和加载完成！已保存到: {savedmodel_path}")
+            print(f"📦 加载模型: {self.model_path}")
+            self.model = WiHelperCNN()
+            state_dict = torch.load(self.model_path, map_location=self.device, weights_only=True)
+            self.model.load_state_dict(state_dict)
+            self.model.to(self.device)
+            self.model.eval()
+            print("✅ 模型加载完成！")
 
         except Exception as e:
-            print(f"❌ 模型转换失败: {e}")
+            print(f"❌ 模型加载失败: {e}")
             sys.exit(1)
 
-    def _cache_output_key(self):
-        """预先找到并缓存输出键名"""
-        # 用一次推理来找出输出键
-        dummy = tf.constant(np.random.rand(1, self.img_height, self.img_width, 3), dtype=tf.float32)
-        dummy_output = self.inference_func(dummy)
-        for key in dummy_output.keys():
-            if 'dense' in key.lower() or 'output' in key.lower():
-                self._output_key = key
-                break
-        if self._output_key is None:
-            self._output_key = list(dummy_output.keys())[0]
-        print(f"✓ 输出键名已缓存: {self._output_key}")
-
     def _warmup_model(self):
-        """预热SavedModel"""
-        print("🔥 预热SavedModel...")
-        dummy_image = None
-        processed = None
+        """预热模型"""
+        print("🔥 预热模型...")
         try:
             for _ in range(3):
                 dummy_image = np.random.randint(0, 255, (self.img_height, self.img_width, 3), dtype=np.uint8)
                 processed = self._fast_preprocess(dummy_image)
-
-                # 使用SavedModel进行推理预热
-                input_tensor = tf.constant(processed, dtype=tf.float32)
-                self.inference_func(input_tensor)
-
-                # 清理临时变量
+                with torch.no_grad():
+                    self.model(processed)
                 del dummy_image
-                dummy_image = None
-        finally:
-            # 确保清理资源
-            if dummy_image is not None:
-                del dummy_image
-            if processed is not None:
-                del processed
-        print("✓ SavedModel预热完成")
+        except Exception as e:
+            print(f"⚠️ 预热过程中出错: {e}")
+        print("✓ 模型预热完成")
 
     def _fast_preprocess(self, image_array):
         """优化的快速预处理"""
-        resized = None
-        img_array = None
-        try:
-            if len(image_array.shape) == 3:
-                # PIL图像已经是RGB格式，直接resize
-                resized = cv2.resize(image_array, (self.img_width, self.img_height), interpolation=cv2.INTER_LINEAR)
-            else:
-                resized = cv2.resize(image_array, (self.img_width, self.img_height))
+        img_float = image_array.astype(np.float32) * (1.0 / 255.0)
+        # HWC -> CHW
+        img_chw = np.transpose(img_float, (2, 0, 1))
 
-            img_array = resized.astype(np.float32) * (1.0/255.0)
+        if self._reuse_buffer is None:
+            self._reuse_buffer = np.expand_dims(img_chw, axis=0)
+        else:
+            self._reuse_buffer[0] = img_chw
 
-            # 复用处理后的图像数组以减少内存分配
-            if self._reuse_processed_image is None:
-                self._reuse_processed_image = np.expand_dims(img_array, axis=0)
-            else:
-                # 直接更新现有数组的数据
-                self._reuse_processed_image[0] = img_array
-
-            return self._reuse_processed_image
-        finally:
-            # 清理临时变量
-            if resized is not None and resized is not image_array:
-                del resized
-            if img_array is not None:
-                del img_array
+        return torch.from_numpy(self._reuse_buffer).to(self.device)
 
     def predict_from_pil_image(self, pil_image):
-        """从PIL图像进行SavedModel推理（优化版）"""
+        """从PIL图像进行推理"""
         try:
-            # 将PIL图像转换为numpy数组
             image_array = np.array(pil_image)
             processed_image = self._fast_preprocess(image_array)
 
-            # 使用SavedModel进行推理
-            input_tensor = tf.constant(processed_image, dtype=tf.float32)
-            prediction = self.inference_func(input_tensor)
-
-            # 使用缓存的键名直接获取概率值
-            probability = float(prediction[self._output_key][0][0])
+            with torch.no_grad():
+                output = self.model(processed_image)
+                probability = torch.sigmoid(output).item()
 
             return probability
         except Exception as e:
-            print(f"❌ SavedModel推理失败: {e}")
+            print(f"❌ 推理失败: {e}")
             return 0.0
 
 class ScreenshotInferenceThread(threading.Thread):
@@ -298,21 +123,17 @@ class ScreenshotInferenceThread(threading.Thread):
         self.running = True
         self.screenshot_lock = threading.Lock()
         self.current_screenshot = None
-        # 预计算截图区域
         self._precompute_capture_region()
         self._last_probability = 0.0
-        self._gc_counter = 0  # 垃圾回收计数器
-        
-        # 帧率统计
+        self._gc_counter = 0
+
         self._frame_count = 0
         self._last_fps_time = time.time()
-        self._fps_interval = 5.0  # 5秒打印一次帧率
+        self._fps_interval = 5.0
 
     def _precompute_capture_region(self):
-        """预计算截图区域坐标"""
-        # 使用推理模块定义的截图尺寸
         size = self.inference_module.capture_size
-        
+
         with mss.mss() as sct:
             monitor = sct.monitors[0]
             center_x = monitor["width"] // 2
@@ -336,24 +157,20 @@ class ScreenshotInferenceThread(threading.Thread):
             }
 
     def run(self):
-        """后台持续截图并推理（性能优化版）"""
         sct = mss.mss()
+        target_frame_time = 1.0 / 60.0  # 目标60FPS
 
         try:
             while self.running:
+                frame_start = time.perf_counter()
                 screenshot = None
                 img = None
                 try:
-                    # 截取屏幕中心区域
                     screenshot = sct.grab(self.capture_region)
-
-                    # 直接创建PIL图像用于推理
                     img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
-                    # 进行推理
                     probability = self.inference_module.predict_from_pil_image(img)
 
-                    # 帧率统计
                     self._frame_count += 1
                     current_time = time.time()
                     if current_time - self._last_fps_time >= self._fps_interval:
@@ -362,25 +179,26 @@ class ScreenshotInferenceThread(threading.Thread):
                         self._frame_count = 0
                         self._last_fps_time = current_time
 
-                    # 根据推理结果设置全局变量
                     global if_exit_goal, current_result
                     with global_lock:
                         old_value = if_exit_goal
                         old_current = current_result
 
-                        current_result = 1 if probability > 0.5 else 0
-                        if_exit_goal = 1 if probability > 0.5 else 0
+                        current_result = 1 if probability > self.inference_module.threshold else 0
+                        if_exit_goal = 1 if probability > self.inference_module.threshold else 0
 
-                    # 调试信息：只在值改变时打印
                     if if_exit_goal != old_value or current_result != old_current:
                         print(f"🎯 推理结果更新: 概率={probability:.3f}, current={current_result}, if_exit_goal={if_exit_goal}")
-                    
-                    time.sleep(0.001)
-                    
+
+                    # 帧率限制：等待剩余时间
+                    elapsed = time.perf_counter() - frame_start
+                    sleep_time = target_frame_time - elapsed
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+
                 except Exception as e:
                     print(f"截图推理线程出错: {e}")
                 finally:
-                    # 确保资源被释放
                     if img is not None:
                         try:
                             img.close()
@@ -396,16 +214,13 @@ class ScreenshotInferenceThread(threading.Thread):
                 pass
 
     def get_current_screenshot(self):
-        """获取当前截图"""
         with self.screenshot_lock:
             if self.current_screenshot is not None:
                 return self.current_screenshot.copy()
             return None
 
     def stop(self):
-        """停止线程并清理资源"""
         self.running = False
-        # 清理当前截图资源
         with self.screenshot_lock:
             if self.current_screenshot is not None:
                 try:
@@ -413,7 +228,6 @@ class ScreenshotInferenceThread(threading.Thread):
                 except:
                     pass
                 self.current_screenshot = None
-        # 强制垃圾回收
         gc.collect()
 
 # --- Windows API 结构体定义 ---
@@ -471,14 +285,12 @@ class RawInputMouseListener:
         self.on_click_callback = on_click_callback
         self.running = True
         self.thread = threading.Thread(target=self._message_loop, daemon=True)
-        # 保存Windows资源引用用于清理
         self.hwnd = None
         self.class_atom = None
         self.thread.start()
 
     def _message_loop(self):
         try:
-            # 创建隐藏窗口
             wc = win32gui.WNDCLASS()
             wc.lpfnWndProc = self._wnd_proc
             wc.lpszClassName = f"RawInputListener_{uuid.uuid4()}"
@@ -489,15 +301,13 @@ class RawInputMouseListener:
             if not hwnd:
                 raise RuntimeError("窗口创建失败")
 
-            # 保存资源引用用于清理
             self.hwnd = hwnd
             self.class_atom = class_atom
 
-            # 注册 Raw Input 鼠标 - 尝试不同的注册模式
             rid = RAWINPUTDEVICE()
-            rid.usUsagePage = 0x01  # 通用桌面控制
-            rid.usUsage = 0x02      # 鼠标
-            rid.dwFlags = RIDEV_INPUTSINK  # 全局捕获所有应用程序的输入
+            rid.usUsagePage = 0x01
+            rid.usUsage = 0x02
+            rid.dwFlags = RIDEV_INPUTSINK
             rid.hwndTarget = hwnd
 
             print(f"🔧 尝试注册模式1: flags=0x{rid.dwFlags:08X}, hwnd={rid.hwndTarget}")
@@ -516,7 +326,6 @@ class RawInputMouseListener:
                             raise RuntimeError("所有Raw Input注册模式都失败")
             print("✅ Raw Input注册成功")
 
-            # 消息循环
             while self.running:
                 win32gui.PumpWaitingMessages()
                 time.sleep(0.005)
@@ -525,7 +334,6 @@ class RawInputMouseListener:
             print(f"❌ 鼠标监听器初始化失败: {e}")
             raise
         finally:
-            # 清理Windows资源
             try:
                 if self.hwnd:
                     win32gui.DestroyWindow(self.hwnd)
@@ -555,31 +363,24 @@ class RawInputMouseListener:
                 print("❌ 获取Raw Input数据失败")
                 return
 
-            # 直接从原始数据包解析按键信息（第28字节）
             button_flags = int.from_bytes(buf.raw[28:32], byteorder='little', signed=False)
 
-            # 只处理按键事件（非0值）
             if button_flags != 0:
-                if button_flags == 0x01:  # 左键按下
+                if button_flags == 0x01:
                     self.on_click_callback('left', True)
-                elif button_flags == 0x04:  # 右键按下
+                elif button_flags == 0x04:
                     self.on_click_callback('right', True)
 
         except Exception as e:
             print(f"❌ 处理Raw Input数据失败: {e}")
         finally:
-            # 清理临时缓冲区
             if buf is not None:
                 del buf
 
     def stop(self):
         self.running = False
-
-        # 等待线程结束
         if self.thread.is_alive():
             self.thread.join(timeout=1.0)
-
-        # 清理Windows资源
         try:
             if self.hwnd:
                 win32gui.DestroyWindow(self.hwnd)
@@ -592,104 +393,84 @@ class RawInputMouseListener:
 
 
 class FeedbackCollector:
-    """反馈数据收集器 - 用于收集开火时的截图数据"""
+    """反馈数据收集器"""
     def __init__(self, save_dir="image"):
         self.save_dir = save_dir
         self.feedback_count = 0
-        
-        # 确保保存目录存在（如果不存在才创建，避免覆盖现有目录）
+
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
             print(f"✓ 创建反馈数据保存目录: {self.save_dir}")
         else:
             print(f"✓ 使用现有目录保存反馈数据: {self.save_dir}")
-    
+
     def collect_feedback_image(self, pil_image, probability):
-        """收集反馈图像数据并立即保存到磁盘"""
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             filename = f"feedback_{timestamp}_{self.feedback_count:04d}_prob{probability:.3f}.png"
-            
-            # 直接保存到磁盘
             filepath = os.path.join(self.save_dir, filename)
             pil_image.save(filepath, format='PNG')
-            
             print(f"✓ 反馈图像已保存: {filename}")
             self.feedback_count += 1
             return True
-            
         except Exception as e:
             print(f"反馈数据保存失败: {e}")
             return False
-    
+
 
 class WiHelper:
     """激光射蚊子助手主类"""
     def __init__(self, fire_cooldown=4.0):
-        self.judging_mode = False  # 判断模式状态
-        self.judging_start_time = 0  # 判断模式开始时间
-        self.right_mouse_pressed = False  # 右键按下状态
-        self.left_mouse_pressed = False   # 左键按下状态
-        self.f_key_pressed = False        # F键按下状态（用于打断判断模式）
-        self.judging_thread = None  # 判断模式线程
-        self.judging_lock = threading.Lock()  # 判断模式状态锁
+        self.judging_mode = False
+        self.judging_start_time = 0
+        self.right_mouse_pressed = False
+        self.left_mouse_pressed = False
+        self.f_key_pressed = False
+        self.judging_thread = None
+        self.judging_lock = threading.Lock()
         self.mouse_listener = RawInputMouseListener(self.on_mouse_click)
-        
-        # 初始化键盘监听器（用于F键打断）
+
         self.keyboard_listener = KeyboardListener(on_press=self.on_key_press)
         self.keyboard_listener.start()
-        
-        # 开枪延迟设置（每一枪之间的时间间隔）
+
         self.fire_cooldown = fire_cooldown
 
-        # 初始化推理模块
         self.inference_module = OptimizedInferenceModule()
-
-        # 初始化截图推理线程
         self.screenshot_thread = ScreenshotInferenceThread(self.inference_module)
         self.screenshot_thread.start()
-        
-        # 初始化反馈数据收集器
+
         self.feedback_collector = FeedbackCollector()
 
-        # 设置进程伪装
         try:
             ctypes.windll.kernel32.SetConsoleTitleW("Windows Service Host")
             print("✓ 进程名称伪装完成")
         except Exception as e:
             print(f"✗ 进程名称伪装失败: {e}")
 
-        # 内存监控计数器
         self._memory_check_counter = 0
 
     def on_key_press(self, key):
-        """键盘按键事件处理"""
         try:
-            # 检查是否按下F键
             if hasattr(key, 'char') and key.char == 'f':
                 if self.judging_mode:
                     print("⌨️ F键按下：打断判断模式")
                     self.f_key_pressed = True
         except AttributeError:
-            pass  # 特殊键（如Shift、Ctrl等）没有char属性，忽略
+            pass
 
     def on_mouse_click(self, button, pressed):
-        """鼠标点击事件处理"""
         global if_dead, global_lock
 
         try:
-            print(f"📡 收到鼠标事件: {button} {'按下' if pressed else '释放'}")  # 临时调试
+            print(f"📡 收到鼠标事件: {button} {'按下' if pressed else '释放'}")
 
             if button == 'right':
                 self.right_mouse_pressed = pressed
                 if pressed:
-                    # 使用非阻塞方式检查状态
                     if self.judging_mode:
-                        # 在判断模式中按右键，退出判断模式
                         print("🖱️ 右键点击：退出判断模式")
                         self.exit_judging_mode()
                     else:
-                        # 不在判断模式，直接启动判断线程
                         if self.judging_thread is None or not self.judging_thread.is_alive():
                             print("🖱️ 右键点击：启动判断模式")
                             self.judging_thread = threading.Thread(target=self.enter_judging_mode_sync, daemon=True)
@@ -698,12 +479,10 @@ class WiHelper:
                             print("🖱️ 右键点击：判断线程正在运行中")
             elif button == 'left':
                 self.left_mouse_pressed = pressed
-                # 左键不再打断判断模式，改为F键打断
         except Exception as e:
             print(f"❌ 鼠标事件处理出错: {e}")
 
     def enter_judging_mode_sync(self):
-        """同步进入判断模式（在当前线程中执行）- 支持最多8枪"""
         global if_dead, if_exit_goal, current_result, global_lock
 
         with global_lock:
@@ -716,38 +495,31 @@ class WiHelper:
             self.judging_start_time = time.time()
             print("🎯 进入瞄准模式 - 炮台正在瞄准中...")
 
-        # 记录进入判断模式时的鼠标状态，避免立即退出
         initial_left_pressed = self.left_mouse_pressed
         initial_right_pressed = self.right_mouse_pressed
 
-        aiming_time = 0.5  # 炮台瞄准时间
-        total_timeout = 4.0  # 总超时时间
+        aiming_time = 0.5
+        total_timeout = 4.0
         start_time = time.time()
-        
-        # 开火计数器
+
         fire_count = 0
         max_fire_count = 8
         last_fire_time = 0
-        fire_cooldown = self.fire_cooldown  # 使用用户设置的开火冷却时间
+        fire_cooldown = self.fire_cooldown
 
         try:
-            # 第一阶段：0.5秒炮台瞄准时间，只检测退出条件，不开火
             while time.time() - start_time < aiming_time:
-                # 检查瞄准模式是否被外部退出（非阻塞检查）
                 if not self.judging_mode:
                     print("🖱️ 瞄准模式被外部退出")
                     return
 
-                # 检查退出条件：右键或F键打断
                 if (self.right_mouse_pressed and not initial_right_pressed) or self.f_key_pressed:
                     reason = "F键" if self.f_key_pressed else "右键"
                     print(f"🖱️ 检测到{reason}打断，退出瞄准模式")
-                    self.f_key_pressed = False  # 重置F键状态
+                    self.f_key_pressed = False
                     self.exit_judging_mode()
                     return
 
-                # 在瞄准时间内不检查目标，避免立即开火
-                # 调试：每100ms打印一次当前状态
                 current_time = time.time()
                 if not hasattr(self, '_last_debug_time'):
                     self._last_debug_time = 0
@@ -758,90 +530,71 @@ class WiHelper:
                     print(f"🔍 炮台瞄准中... current={current_current_result}, if_exit_goal={current_if_exit_goal}, 经过时间={current_time - start_time:.1f}s")
                     self._last_debug_time = current_time
 
-                time.sleep(0.005)  # 小延迟避免CPU占用过高
+                time.sleep(0.005)
 
-            # 第二阶段：继续等待直到超时，支持最多8枪
             while time.time() - start_time < total_timeout:
-                # 检查瞄准模式是否被外部退出（非阻塞检查）
                 if not self.judging_mode:
                     print(f"🖱️ 瞄准模式被外部退出 (已开火{fire_count}枪)")
                     return
 
-                # 检查退出条件：右键或F键打断
                 if (self.right_mouse_pressed and not initial_right_pressed) or self.f_key_pressed:
                     reason = "F键" if self.f_key_pressed else "右键"
                     print(f"🖱️ 检测到{reason}打断，退出瞄准模式 (已开火{fire_count}枪)")
-                    self.f_key_pressed = False  # 重置F键状态
+                    self.f_key_pressed = False
                     self.exit_judging_mode()
                     return
 
-                # 实时检查目标 - 移除双重检测，直接响应
                 with global_lock:
                     current_if_exit_goal = if_exit_goal
                     current_current_result = current_result
-                
+
                 current_time = time.time()
-                
-                # 只要当前结果是开火状态就立即开火
+
                 if current_current_result == 1:
-                    # 检查是否在冷却时间内
                     if current_time - last_fire_time >= fire_cooldown:
                         fire_count += 1
                         print(f"🎯 检测到目标，立即开火！(第{fire_count}/{max_fire_count}枪)")
                         self.fire_laser()
                         last_fire_time = current_time
-                        
-                        # 检查是否达到最大开火次数，或者在大狙模式下（延迟>=4s）开一枪就退出
+
                         is_sniper_mode = self.fire_cooldown >= 4.0
                         if fire_count >= max_fire_count or is_sniper_mode:
                             reason = f"达到最大开火次数({max_fire_count}枪)" if not is_sniper_mode else "大狙模式单发命中"
                             print(f"✅ {reason}，退出瞄准模式")
                             self.exit_judging_mode()
                             return
-                    # else: 在冷却时间内，不打印信息，继续等待
 
-                time.sleep(0.005)  # 小延迟避免CPU占用过高
+                time.sleep(0.005)
 
-            # 超时未检测到目标或未达到最大开火次数
             if fire_count > 0:
                 print(f"⏱️ 判断超时，共开火{fire_count}枪")
             else:
                 print("❌ 判断超时，未检测到有效目标")
             self.exit_judging_mode()
         finally:
-            # 确保退出判断模式
             self.exit_judging_mode()
 
     def exit_judging_mode(self):
-        """退出判断模式"""
         with self.judging_lock:
             self.judging_mode = False
             self.judging_start_time = 0
             print("🏁 退出判断模式")
 
     def fire_laser(self):
-        """开火 - 模拟键盘敲击P，同时收集反馈数据（仅大狙模式）"""
         keyboard = None
         try:
-            # 只在大狙模式（延迟>=4秒）时收集反馈数据
             if self.fire_cooldown >= 4.0:
                 current_screenshot = self.screenshot_thread.get_current_screenshot()
                 if current_screenshot is not None:
-                    # 重新进行推理获取准确概率（而不是使用二值化的if_exit_goal）
                     current_probability = self.inference_module.predict_from_pil_image(current_screenshot)
-                    
-                    # 收集反馈数据
                     self.feedback_collector.collect_feedback_image(current_screenshot, current_probability)
                     print(f"📊 已收集反馈数据，概率: {current_probability:.3f}")
                 else:
                     print("⚠️ 无法获取当前截图，跳过反馈数据收集")
-            # else: 连狙模式不保存图片，静默跳过
-            
-            # 使用pynput模拟键盘敲击P
+
             keyboard = KeyboardController()
             keyboard.press('p')
             keyboard.release('p')
-
             print("💥 激光发射成功！")
 
         except Exception as e:
@@ -851,15 +604,12 @@ class WiHelper:
                 del keyboard
 
     def play_fire_sound(self):
-        """播放开火音效"""
         try:
-            # 使用系统默认提示音
             winsound.MessageBeep(0x40)
         except Exception as e:
             print(f"❌ 音频播放失败: {e}")
 
     def run(self):
-        """主循环"""
         print("🚀 WiHelper激光射蚊子助手启动")
         print(f"⏱️  当前开枪延迟设置: {self.fire_cooldown}秒")
         if self.fire_cooldown >= 4.0:
@@ -873,14 +623,11 @@ class WiHelper:
         print("⌨️  按Ctrl+C退出程序")
 
         try:
-            # 主线程只负责监听鼠标事件，不再阻塞
             while True:
-                # 定期进行垃圾回收
                 self._memory_check_counter += 1
-                if self._memory_check_counter >= 1000:  # 每1000次循环进行一次垃圾回收
+                if self._memory_check_counter >= 1000:
                     gc.collect()
                     self._memory_check_counter = 0
-                
                 time.sleep(1)
 
         except KeyboardInterrupt:
@@ -891,39 +638,46 @@ class WiHelper:
             self.cleanup()
 
     def cleanup(self):
-        """清理资源"""
         print("正在清理资源...")
 
-        # 停止判断线程
         if self.judging_thread and self.judging_thread.is_alive():
             self.judging_thread.join(timeout=1.0)
 
-        # 停止截图推理线程
         if self.screenshot_thread:
             self.screenshot_thread.stop()
             self.screenshot_thread.join(timeout=1.0)
 
-        # 停止鼠标监听器
         if self.mouse_listener:
             self.mouse_listener.stop()
 
-        # 停止键盘监听器
         if self.keyboard_listener:
             self.keyboard_listener.stop()
 
-        # 清理TensorFlow资源
         try:
-            tf.keras.backend.clear_session()
-            print("✓ TensorFlow会话已清理")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print("✓ GPU缓存已清理")
         except Exception as e:
-            print(f"⚠️ TensorFlow清理失败: {e}")
+            print(f"⚠️ GPU清理失败: {e}")
 
-        # 强制垃圾回收
         gc.collect()
         print("✅ 清理完成")
 
 def main():
-    """主函数 - 提示用户输入开枪延迟设置"""
+    import sys
+
+    print(f"PyTorch 版本: {torch.__version__}")
+    print(f"CUDA 可用: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA 设备: {torch.cuda.get_device_name(0)}")
+    else:
+        print("\n✗ 未检测到CUDA GPU，无法继续！")
+        print("  请确认:")
+        print("  1. 已安装 NVIDIA 显卡驱动")
+        print("  2. 已安装 CUDA Toolkit")
+        print("  3. 已安装对应版本的 PyTorch")
+        sys.exit(1)
+
     print("=" * 60)
     print("🎯 WiHelper激光射蚊子助手 - 启动配置")
     print("=" * 60)
@@ -936,12 +690,12 @@ def main():
     print("  - 延迟 >= 4秒: 大狙模式，第一枪后因为延迟长会超时退出")
     print("  - 延迟 < 4秒: 连狙模式，4秒内最多连续射击8枪")
     print()
-    
-    fire_cooldown = 4.0  # 默认值
-    
+
+    fire_cooldown = 4.0
+
     try:
         user_input = input("请输入延迟时间（秒）或直接回车使用默认值: ").strip()
-        
+
         if user_input == "":
             print(f"✓ 使用默认延迟: {fire_cooldown}秒（大狙模式）")
         else:
@@ -964,12 +718,11 @@ def main():
     except Exception as e:
         print(f"⚠️ 输入错误: {e}，使用默认值4秒")
         fire_cooldown = 4.0
-    
+
     print()
     print("=" * 60)
     print()
-    
-    # 创建WiHelper实例并运行
+
     helper = WiHelper(fire_cooldown=fire_cooldown)
     helper.run()
 
