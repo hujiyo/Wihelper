@@ -82,6 +82,40 @@ class WiHelperCNN(nn.Module):
         return x
 
 
+def center_crop(img, size=120):
+    """中心裁剪 numpy 图像"""
+    h, w = img.shape[:2]
+    ch = (h - size) // 2
+    cw = (w - size) // 2
+    return img[ch:ch + size, cw:cw + size]
+
+
+def preprocess(path):
+    """图像预处理: OpenCV读取 → 中心裁剪144→120 → RGB → /255 → CHW tensor"""
+    img = cv2.imread(path)
+    if img is None:
+        return None
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = center_crop(img, 120)
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))
+    return torch.from_numpy(img).unsqueeze(0)
+
+
+def find_best_model():
+    """自动查找 best 模型文件"""
+    candidates = ["models/best_model.pth", "models-v1.1-4/best_model.pth"]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    for d in ["models", "models-v1.1-4"]:
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if "best" in f.lower() and f.endswith(".pth"):
+                    return os.path.join(d, f)
+    return None
+
+
 def tactical_score(y_true, y_pred_prob, threshold=0.5, fp_penalty=5.0):
     """
     战术得分: 每次正确检出 +1 分, 每次误报扣 fp_penalty 分
