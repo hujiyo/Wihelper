@@ -10,43 +10,8 @@ import sys
 import shutil
 import numpy as np
 import torch
-import cv2
 from PIL import Image
-from train_model import WiHelperCNN
-
-
-def center_crop(img, size=120):
-    h, w = img.shape[:2]
-    ch = (h - size) // 2
-    cw = (w - size) // 2
-    return img[ch:ch + size, cw:cw + size]
-
-
-def preprocess(path):
-    """与训练流程一致: OpenCV读取 → 中心裁剪144→120 → RGB → /255 → CHW"""
-    img = cv2.imread(path)
-    if img is None:
-        return None
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = center_crop(img, 120)
-    img = img.astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))
-    return torch.from_numpy(img).unsqueeze(0)
-
-
-def find_best_model():
-    """自动查找 models/ 下的 best 模型"""
-    candidates = ["models/best_model.pth", "models-v1.1-4/best_model.pth"]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    # 兜底: 找任何包含 best 的 pth
-    for d in ["models", "models-v1.1-4"]:
-        if os.path.isdir(d):
-            for f in os.listdir(d):
-                if "best" in f.lower() and f.endswith(".pth"):
-                    return os.path.join(d, f)
-    return None
+from train_model import WiHelperCNN, preprocess, find_best_model
 
 
 def main():
