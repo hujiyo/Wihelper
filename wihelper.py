@@ -21,6 +21,7 @@ import ctypes.wintypes as wintypes
 import winsound
 from pynput.keyboard import Controller as KeyboardController, Listener as KeyboardListener, Key
 import gc
+import signal
 from datetime import datetime
 from train_model import WiHelperCNN
 
@@ -33,7 +34,7 @@ current_result = 0
 
 class OptimizedInferenceModule:
     """优化的推理模块 - 直接使用120×120输入"""
-    def __init__(self, model_path="models-v1.1-4/best_model.pth", threshold=0.5):
+    def __init__(self, model_path="models-v1.1-4/best_model.pth", threshold=0.8):
         self.model_path = model_path
         self.threshold = threshold
 
@@ -665,6 +666,11 @@ class WiHelper:
 
 def main():
     import sys
+
+    # 优先注册SIGINT处理器，防止Intel Fortran运行时拦截Ctrl+C
+    def _sigint_handler(sig, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, _sigint_handler)
 
     print(f"PyTorch 版本: {torch.__version__}")
     print(f"CUDA 可用: {torch.cuda.is_available()}")
