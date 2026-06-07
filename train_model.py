@@ -16,6 +16,7 @@ from datetime import datetime
 import cv2
 import tensorflow.keras.backend as K
 
+
 def print_training_progress(epoch, total_epochs, logs, test_generator=None, model=None):
     """简单的训练进度显示函数"""
     print(f"\nEpoch {epoch + 1}/{total_epochs} - "
@@ -85,166 +86,19 @@ class WiHelperTrainer:
         tf.random.set_seed(42)
 
     def create_model(self):
-        """创建CNN模型 - 支持三种架构方案"""
-        
-        # 方案选择菜单
+        """创建CNN模型"""
         print("\n" + "="*40)
-        print("请选择模型架构方案:")
-        print("  [1] 平衡微调版 - 3 Block, Flatten+Dense (推荐，默认)")
-        print("  [2] 位置敏感版 - 减少池化, 36×36分辨率")
-        print("  [3] 高效位置敏感版 - 深度可分离卷积, 快速推理")
-        print("  [4] 轻量极速版 - 120×120输入, 全链路加速")
+        print("使用 CNN轻量极速版 (120×120内部处理)")
         print("="*40)
-        
-        choice = input("请输入方案编号 [1/2/3/4]: ").strip()
-        if choice == '2':
-            print("✓ 已选择方案2: 位置敏感版")
-            return self._create_model_v2()
-        elif choice == '3':
-            print("✓ 已选择方案3: 高效位置敏感版")
-            return self._create_model_v3()
-        elif choice == '4':
-            print("✓ 已选择方案4: 轻量极速版 (120×120)")
-            return self._create_model_v4()
-        else:
-            if choice not in ['1', '']:
-                print(f"⚠️ 未知选项 '{choice}'，使用默认方案1")
-            print("✓ 已选择方案1: 平衡微调版")
-            return self._create_model_v1()
+        return self._create_model()
 
-    def _create_model_v1(self):
-        """方案1: 平衡微调版 (3 Block, 双卷积)"""
-        model = keras.Sequential([
-            layers.Input(shape=(self.img_height, self.img_width, 3)),
-
-            # Block 1 (144 -> 72)
-            layers.Conv2D(16, (3, 3), activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.Conv2D(16, (3, 3), activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.MaxPooling2D((2, 2)),
-            layers.Dropout(0.1),
-
-            # Block 2 (72 -> 36)
-            layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.MaxPooling2D((2, 2)),
-            layers.Dropout(0.1),
-
-            # Block 3 (36 -> 18) - 增加一层下采样
-            layers.Conv2D(64, (3, 3), activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.MaxPooling2D((2, 2)),
-            layers.Dropout(0.15),
-            
-            layers.Flatten(), # 18*18*64 = 20736
-
-            layers.Dense(128, activation='relu'),
-            layers.BatchNormalization(),
-            layers.Dropout(0.3),
-            layers.Dense(64, activation='relu'),
-            layers.BatchNormalization(),
-            layers.Dropout(0.2),
-            
-            layers.Dense(1, activation='sigmoid')
-        ])
-        # 使用标准BCE + class_weight
-        model.compile(optimizer='adam',
-                     loss='binary_crossentropy',
-                     metrics=['accuracy', keras.metrics.AUC(name='auc')])
-        return model
-
-    def _create_model_v2(self):
-        """方案2: 位置敏感版 (减少池化，压缩全连接，保留更高空间分辨率)"""
-        model = keras.Sequential([
-            layers.Input(shape=(self.img_height, self.img_width, 3)),
-
-            # Block 1 (144 → 72)
-            layers.Conv2D(16, (3, 3), activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.Conv2D(16, (3, 3), activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.MaxPooling2D((2, 2)),
-            layers.Dropout(0.1),
-
-            # Block 2 (72 → 36)
-            layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.MaxPooling2D((2, 2)),
-            layers.Dropout(0.1),
-
-            # Block 3 (36 → 36) - 不池化，保留空间分辨率
-            layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.Dropout(0.15),
-            
-            # 36×36×32 = 41,472
-            layers.Flatten(),
-
-            # 压缩全连接层 (41472 × 64 ≈ 265万参数，与方案1相当)
-            layers.Dense(64, activation='relu'),
-            layers.BatchNormalization(),
-            layers.Dropout(0.3),
-            
-            layers.Dense(1, activation='sigmoid')
-        ])
-        
-        model.compile(optimizer='adam',
-                     loss='binary_crossentropy',
-                     metrics=['accuracy', keras.metrics.AUC(name='auc')])
-        return model
-
-    def _create_model_v3(self):
-        """方案3: 高效位置敏感版 (深度可分离卷积 + 高分辨率 + 适中Dense)"""
-        model = keras.Sequential([
-            layers.Input(shape=(self.img_height, self.img_width, 3)),
-
-            # Block 1 (144 → 72) - 首层用标准卷积提取基础特征
-            layers.Conv2D(16, (3, 3), activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.MaxPooling2D((2, 2)),
-            layers.Dropout(0.1),
-
-            # Block 2 (72 → 36) - 深度可分离卷积，大幅减少计算量
-            layers.SeparableConv2D(32, (3, 3), activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.SeparableConv2D(32, (3, 3), activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.MaxPooling2D((2, 2)),
-            layers.Dropout(0.1),
-
-            # Block 3 (36 → 36) - 不池化，保留空间分辨率
-            layers.SeparableConv2D(24, (3, 3), activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.Dropout(0.15),
-            
-            # 36×36×24 = 31,104
-            layers.Flatten(),
-
-            # 适中的Dense层 (31104 × 96 ≈ 298万参数)
-            layers.Dense(96, activation='relu'),
-            layers.BatchNormalization(),
-            layers.Dropout(0.3),
-            
-            layers.Dense(1, activation='sigmoid')
-        ])
-        
-        model.compile(optimizer='adam',
-                     loss='binary_crossentropy',
-                     metrics=['accuracy', keras.metrics.AUC(name='auc')])
-        return model
-
-    def _create_model_v4(self):
-        """方案4: 轻量极速版 (内部中心裁剪到120×120，基于方案1架构)"""
-        # 输入144×144 → 中心裁剪120×120 → 60×60 → 30×30 → 15×15
+    def _create_model(self):
+        """CNN轻量极速版 (144×144输入，内部裁剪到120×120)"""
+        # 144×144 → CenterCrop → 120×120 → 60×60 → 30×30 → 15×15
         # Flatten: 15×15×64 = 14,400
         model = keras.Sequential([
-            layers.Input(shape=(self.img_height, self.img_width, 3)),  # 仍接收144×144
-            
+            layers.Input(shape=(self.img_height, self.img_width, 3)),  # 144×144
+
             # 中心裁剪层: 144×144 → 120×120
             layers.CenterCrop(120, 120),
 
@@ -269,7 +123,7 @@ class WiHelperTrainer:
             layers.BatchNormalization(),
             layers.MaxPooling2D((2, 2)),
             layers.Dropout(0.15),
-            
+
             # 15×15×64 = 14,400
             layers.Flatten(),
 
@@ -279,10 +133,10 @@ class WiHelperTrainer:
             layers.Dense(64, activation='relu'),
             layers.BatchNormalization(),
             layers.Dropout(0.2),
-            
+
             layers.Dense(1, activation='sigmoid')
         ])
-        
+
         model.compile(optimizer='adam',
                      loss='binary_crossentropy',
                      metrics=['accuracy', keras.metrics.AUC(name='auc')])
@@ -474,8 +328,17 @@ class WiHelperTrainer:
             print(f"路径: {self.data_dir}")
             return
 
-        # 创建数据生成器
-        print("步骤1/3: 加载训练数据...")
+        # 创建模型
+        print("\n步骤1/3: 创建模型...")
+        model = self.create_model()
+        model.summary() # 打印模型结构
+
+        # 开始训练
+        return self._train(model)
+
+    def _train(self, model):
+        """CNN模型训练流程 - 使用动态类别权重"""
+        print("\n步骤2/3: 加载训练数据...")
         train_generator, test_generator = self.create_data_generators()
         print("数据统计:")
         print(f"训练样本数: {train_generator.samples}")
@@ -485,21 +348,280 @@ class WiHelperTrainer:
         # 计算类别权重
         self.class_weights = self.compute_class_weights()
 
-        # 创建模型
-        print("\n步骤2/3: 创建CNN模型...")
-        model = self.create_model()
-        model.summary() # 打印模型结构
-
-        # 手动训练循环，简化进度显示
-        print("\n开始训练模型...")
+        print("\n步骤3/3: 开始训练模型...")
         print(f"  - 最大轮次: {self.epochs}")
         print(f"  - 批次大小: {self.batch_size}")
         print("  - 优化器: Adam")
-        print("  - 损失函数: Binary Cross Entropy + Class Weight")
+        print("  - 损失函数: Binary Cross Entropy + 动态类别权重")
         print("  - 指标: Accuracy, AUC")
-        print("  - 训练数据: image/train/")
-        print("  - 测试数据: image/test/")
         print("\n开始训练 (每轮显示进度和测试评估)...")
+
+        # 学习率调度参数
+        warmup_epochs = 5
+        initial_lr = 1e-4
+        peak_lr = 3e-4
+        min_lr = 1e-6
+        accumulation_steps = 4
+        patience = 15
+        patience_counter = 0
+
+        # 训练历史记录
+        history = {
+            'loss': [], 'accuracy': [], 'auc': [],
+            'test_loss': [], 'test_accuracy': [], 'test_auc': []
+        }
+        best_weights = None
+        best_auc = 0.0
+        best_epoch = 0
+
+        for epoch in range(self.epochs):
+            # 计算当前学习率
+            if epoch < warmup_epochs:
+                current_lr = initial_lr + (peak_lr - initial_lr) * (epoch / warmup_epochs)
+            else:
+                progress = (epoch - warmup_epochs) / (self.epochs - warmup_epochs)
+                current_lr = min_lr + 0.5 * (peak_lr - min_lr) * (1 + np.cos(np.pi * progress))
+
+            # 应用学习率
+            tf.keras.backend.set_value(model.optimizer.learning_rate, current_lr)
+
+            print(f"\nEpoch {epoch + 1}/{self.epochs} (lr: {current_lr:.2e})")
+            epoch_start_time = datetime.now()
+
+            # 训练一个epoch - 使用梯度累积
+            epoch_logs = {'loss': 0, 'accuracy': 0, 'auc': 0}
+            batch_count = 0
+            accum_count = 0
+            accumulated_gradients = None
+            accum_labels = []
+            accum_batches = []
+            train_generator.reset()
+
+            for batch_x, batch_y in train_generator:
+                accum_batches.append((batch_x, batch_y))
+                accum_labels.extend(batch_y.tolist())
+                accum_count += 1
+
+                if accum_count >= accumulation_steps:
+                    # 计算动态权重
+                    accum_labels_arr = np.array(accum_labels)
+                    n_pos = np.sum(accum_labels_arr == 1)
+                    n_neg = np.sum(accum_labels_arr == 0)
+                    total = n_pos + n_neg
+
+                    if n_pos > 0 and n_neg > 0:
+                        pos_weight = total / (2.0 * n_pos)
+                        neg_weight = total / (2.0 * n_neg)
+                    else:
+                        pos_weight = 1.0
+                        neg_weight = 1.0
+
+                    for acc_batch_x, acc_batch_y in accum_batches:
+                        batch_weights = np.array([pos_weight if label == 1 else neg_weight for label in acc_batch_y])
+
+                        with tf.GradientTape() as tape:
+                            predictions = model(acc_batch_x, training=True)
+                            bce = tf.keras.losses.BinaryCrossentropy(reduction=tf.keras.losses.Reduction.NONE)
+                            loss = bce(acc_batch_y, predictions[:, 0])
+                            weighted_loss = loss * batch_weights
+                            batch_loss = tf.reduce_mean(weighted_loss) / accumulation_steps
+
+                        gradients = tape.gradient(batch_loss, model.trainable_variables)
+
+                        if accumulated_gradients is None:
+                            accumulated_gradients = [tf.Variable(tf.zeros_like(g), trainable=False) if g is not None else None for g in gradients]
+
+                        for i, grad in enumerate(gradients):
+                            if grad is not None and accumulated_gradients[i] is not None:
+                                accumulated_gradients[i].assign_add(grad)
+
+                        epoch_logs['loss'] += float(tf.reduce_mean(loss))
+                        pred_classes = tf.cast(predictions[:, 0] > 0.5, tf.float32)
+                        epoch_logs['accuracy'] += float(tf.reduce_mean(tf.cast(tf.equal(pred_classes, acc_batch_y), tf.float32)))
+                        epoch_logs['auc'] += float(tf.keras.metrics.AUC()(acc_batch_y, predictions[:, 0]))
+                        batch_count += 1
+
+                    # 应用梯度
+                    model.optimizer.apply_gradients(
+                        [(g, v) for g, v in zip(accumulated_gradients, model.trainable_variables) if g is not None]
+                    )
+
+                    # 重置
+                    for g in accumulated_gradients:
+                        if g is not None:
+                            g.assign(tf.zeros_like(g))
+                    accum_count = 0
+                    accum_labels = []
+                    accum_batches = []
+
+                if batch_count >= len(train_generator):
+                    break
+
+            # 处理剩余数据
+            if accum_count > 0 and len(accum_batches) > 0:
+                accum_labels_arr = np.array(accum_labels)
+                n_pos = np.sum(accum_labels_arr == 1)
+                n_neg = np.sum(accum_labels_arr == 0)
+                total = n_pos + n_neg
+
+                if n_pos > 0 and n_neg > 0:
+                    pos_weight = total / (2.0 * n_pos)
+                    neg_weight = total / (2.0 * n_neg)
+                else:
+                    pos_weight = 1.0
+                    neg_weight = 1.0
+
+                for acc_batch_x, acc_batch_y in accum_batches:
+                    batch_weights = np.array([pos_weight if label == 1 else neg_weight for label in acc_batch_y])
+
+                    with tf.GradientTape() as tape:
+                        predictions = model(acc_batch_x, training=True)
+                        bce = tf.keras.losses.BinaryCrossentropy(reduction=tf.keras.losses.Reduction.NONE)
+                        loss = bce(acc_batch_y, predictions[:, 0])
+                        weighted_loss = loss * batch_weights
+                        batch_loss = tf.reduce_mean(weighted_loss) / len(accum_batches)
+
+                    gradients = tape.gradient(batch_loss, model.trainable_variables)
+
+                    if accumulated_gradients is None:
+                        accumulated_gradients = [tf.Variable(tf.zeros_like(g), trainable=False) if g is not None else None for g in gradients]
+
+                    for i, grad in enumerate(gradients):
+                        if grad is not None and accumulated_gradients[i] is not None:
+                            accumulated_gradients[i].assign_add(grad)
+
+                    epoch_logs['loss'] += float(tf.reduce_mean(loss))
+                    pred_classes = tf.cast(predictions[:, 0] > 0.5, tf.float32)
+                    epoch_logs['accuracy'] += float(tf.reduce_mean(tf.cast(tf.equal(pred_classes, acc_batch_y), tf.float32)))
+                    epoch_logs['auc'] += float(tf.keras.metrics.AUC()(acc_batch_y, predictions[:, 0]))
+                    batch_count += 1
+
+                if accumulated_gradients is not None:
+                    model.optimizer.apply_gradients(
+                        [(g, v) for g, v in zip(accumulated_gradients, model.trainable_variables) if g is not None]
+                    )
+
+            # 计算平均值
+            for key in epoch_logs:
+                epoch_logs[key] /= batch_count
+
+            history['loss'].append(epoch_logs['loss'])
+            history['accuracy'].append(epoch_logs['accuracy'])
+            history['auc'].append(epoch_logs['auc'])
+
+            epoch_time = datetime.now() - epoch_start_time
+            print(f"训练完成 - 用时: {epoch_time.seconds}.{epoch_time.microseconds//100000}s")
+
+            # 评估测试集
+            test_results = print_training_progress(epoch, self.epochs, epoch_logs, test_generator, model)
+            if test_results:
+                test_loss, test_accuracy, test_auc = test_results
+                history['test_loss'].append(test_loss)
+                history['test_accuracy'].append(test_accuracy)
+                history['test_auc'].append(test_auc)
+
+                # 早停
+                if test_auc > best_auc:
+                    best_auc = test_auc
+                    best_epoch = epoch + 1
+                    patience_counter = 0
+                    best_weights = model.get_weights()
+                    print(f"✓ 发现更好的模型 (AUC: {test_auc:.4f})，已暂存到内存")
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        print(f"早停: 测试AUC在{patience}轮内没有提升")
+                        break
+
+        # 保存模型
+        print("\n保存模型到磁盘...")
+        final_weights = model.get_weights()
+        model.save(os.path.join(self.model_save_dir, 'final_model.h5'))
+        print("✓ 最终模型已保存 (final_model.h5)")
+
+        if best_weights is not None:
+            model.set_weights(best_weights)
+            model.save(os.path.join(self.model_save_dir, 'best_model.h5'))
+            print(f"✓ 最佳模型已保存 (best_model.h5, 来自第{best_epoch}轮, AUC: {best_auc:.4f})")
+            model.set_weights(final_weights)
+        else:
+            model.save(os.path.join(self.model_save_dir, 'best_model.h5'))
+            print("✓ 最佳模型已保存 (best_model.h5, 与最终模型相同)")
+
+        # 评估
+        print("\n评估模型性能...")
+        accuracy, class_report = self.evaluate_model(model, test_generator)
+
+        # 生成报告
+        print("\n生成完整训练报告...")
+        self.save_complete_info(model, history, accuracy, class_report)
+        print("✓ 完整训练报告已保存 (info.txt)")
+
+        print("训练完成总结:")
+        print(f"  - 最终训练准确率: {history['accuracy'][-1]:.4f}")
+        print(f"  - 最终测试准确率: {history['test_accuracy'][-1]:.4f}")
+        print(f"  - 实际训练轮次: {len(history['accuracy'])}")
+        print(f"  - 模型保存路径: {self.model_save_dir}")
+
+        return model, history
+
+    def save_complete_info(self, model, history, accuracy, class_report):
+        """保存CNN训练信息"""
+        self.save_complete_info(model, history, accuracy, class_report)
+
+    def save_complete_info(self, model, history, accuracy, class_report):
+        """保存完整训练信息"""
+        info_path = os.path.join(self.model_save_dir, 'info.txt')
+
+        with open(info_path, 'w', encoding='utf-8') as f:
+            f.write("基本信息:\n")
+            f.write(f"训练日期: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"最终测试准确率: {accuracy:.4f}\n")
+            f.write(f"实际训练轮次: {len(history['accuracy'])}\n\n")
+            f.write(f"图像大小: {self.img_height}x{self.img_width}\n")
+            f.write(f"批次大小: {self.batch_size}\n")
+            f.write(f"最大轮次: {self.epochs}\n")
+            f.write(f"优化器: adam (initial_lr=1e-4)\n")
+            f.write(f"损失函数: binary_crossentropy + class_weight\n")
+            f.write(f"指标: accuracy, auc\n\n")
+            f.write("类别权重信息 (仅供参考，未在Loss中叠加):\n")
+            f.write(f"nogot类别权重: {self.class_weights[0]:.4f}\n")
+            f.write(f"got类别权重: {self.class_weights[1]:.4f}\n")
+            f.write(f"权重比值 (got/nogot): {self.class_weights[1]/self.class_weights[0]:.4f}\n\n")
+            f.write("-" * 30 + "\n") # 模型结构分隔线
+            stringlist = [] # 模型结构列表
+            model.summary(print_fn=lambda x: stringlist.append(x))
+            for line in stringlist:
+                f.write(line + "\n")
+            f.write("\n")
+
+            f.write("训练历史:\n")
+            f.write(f"总训练轮次: {len(history['accuracy'])}\n\n")
+            f.write("轮次\t训练准确率\t测试准确率\t训练损失\t测试损失\t训练AUC\t测试AUC\n")
+            f.write("-" * 80 + "\n") # 表头分隔线
+
+            for epoch in range(len(history['accuracy'])): # 每轮数据
+                f.write(f"{epoch+1:2d}\t")
+                f.write(f"{history['accuracy'][epoch]:.4f}\t")
+                f.write(f"{history['test_accuracy'][epoch]:.4f}\t")
+                f.write(f"{history['loss'][epoch]:.4f}\t")
+                f.write(f"{history['test_loss'][epoch]:.4f}\t")
+                f.write(f"{history['auc'][epoch]:.4f}\t")
+                f.write(f"{history['test_auc'][epoch]:.4f}\t")
+                f.write("\n")
+
+            f.write("\n" + "=" * 50 + "\n最终结果总结:\n" + "=" * 50 + "\n")
+            f.write(f"最终训练准确率: {history['accuracy'][-1]:.4f}\n")
+            f.write(f"最终测试准确率: {history['test_accuracy'][-1]:.4f}\n")
+            f.write(f"最终训练损失: {history['loss'][-1]:.4f}\n")
+            f.write(f"最终测试损失: {history['test_loss'][-1]:.4f}\n")
+            f.write(f"最终训练AUC: {history['auc'][-1]:.4f}\n")
+            f.write(f"最终测试AUC: {history['test_auc'][-1]:.4f}\n\n")
+
+            f.write("分类报告:\n")
+            f.write("-" * 30 + "\n")
+            f.write(class_report)
+            f.write("\n")
 
         # 学习率调度参数
         warmup_epochs = 5           # 预热轮次
