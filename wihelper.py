@@ -84,7 +84,10 @@ class OptimizedInferenceModule:
         self.threshold = threshold
         self.capture_size = 120
 
-        self._reuse_buffer = None
+        # 预分配推理输入 buffer，避免每帧重新分配
+        self._input_buf = np.zeros((1, 3, 120, 120), dtype=np.float32)
+        self._inv_255 = np.float32(1.0 / 255.0)
+        self._is_gpu = False
         self._load_model()
         self._warmup_model()
 
@@ -95,7 +98,6 @@ class OptimizedInferenceModule:
         base_dir = get_base_dir()
         abs_model_path = os.path.join(base_dir, self.model_path)
         if not os.path.exists(abs_model_path):
-            # 尝试作为绝对路径
             if os.path.exists(self.model_path):
                 abs_model_path = self.model_path
             else:
@@ -108,10 +110,14 @@ class OptimizedInferenceModule:
 
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess_options.intra_op_num_threads = 4
+        # DirectML 官方要求：必须关闭 memory pattern 和使用顺序执行模式
+        sess_options.enable_mem_pattern = False
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        # GPU 推理时 CPU 线程数越少越好，减少线程争抢
+        sess_options.intra_op_num_threads = 1
         sess_options.inter_op_num_threads = 1
 
-        # DirectML 优先 → CPU 兜底
+        # DirectML 优先 → CUDA → CPU 兜底
         available_providers = ort.get_available_providers()
         providers = []
         if 'DmlExecutionProvider' in available_providers:
@@ -131,6 +137,7 @@ class OptimizedInferenceModule:
             )
 
         active_provider = self.session.get_providers()[0]
+        self._is_gpu = active_provider in ('DmlExecutionProvider', 'CUDAExecutionProvider')
         provider_name = {
             'DmlExecutionProvider': 'DirectML (GPU)',
             'CUDAExecutionProvider': 'CUDA (GPU)',
@@ -143,30 +150,42 @@ class OptimizedInferenceModule:
         """预热模型"""
         print("🔥 预热模型...")
         try:
+            dummy_bgra = np.random.randint(0, 255, (120, 120, 4), dtype=np.uint8).tobytes()
             for _ in range(5):
-                dummy = np.random.randint(0, 255, (120, 120, 3), dtype=np.uint8)
-                _ = self.predict_from_pil_image(Image.fromarray(dummy))
+                _ = self.predict_from_raw_bgra(dummy_bgra, 120, 120)
         except Exception as e:
             print(f"⚠️ 预热出错: {e}")
         print("✓ 模型预热完成")
 
-    def predict_from_pil_image(self, pil_image):
-        """从 PIL 图像进行推理"""
+    def predict_from_raw_bgra(self, bgra_bytes, width, height):
+        """从 mss 截图的原始 BGRA 字节直接推理（零 PIL，零中间数组）"""
         try:
-            image_array = np.ascontiguousarray(pil_image, dtype=np.float32)
-            image_array *= (1.0 / 255.0)
+            raw = np.frombuffer(bgra_bytes, dtype=np.uint8).reshape(height, width, 4)
+            buf = self._input_buf[0]  # shape (3, H, W)
+            # BGRA → RGB，直接写入预分配的 CHW buffer
+            buf[0] = raw[:, :, 2]  # R
+            buf[1] = raw[:, :, 1]  # G
+            buf[2] = raw[:, :, 0]  # B
+            # in-place 归一化
+            buf *= self._inv_255
+            # 推理
+            logit = self.session.run(None, {"image": self._input_buf})[0]
+            return float(1.0 / (1.0 + np.exp(-logit[0, 0])))
+        except Exception as e:
+            print(f"❌ 推理失败: {e}")
+            return 0.0
 
-            # HWC -> CHW -> NCHW，复用 buffer 减少分配
-            img_chw = np.transpose(image_array, (2, 0, 1))
-            if self._reuse_buffer is None or self._reuse_buffer.shape != (1, 3, 120, 120):
-                self._reuse_buffer = np.expand_dims(img_chw, axis=0)
-            else:
-                self._reuse_buffer[0] = img_chw
-
-            logit = self.session.run(None, {"image": self._reuse_buffer})[0]
-            probability = 1.0 / (1.0 + np.exp(-logit[0, 0]))  # sigmoid
-
-            return float(probability)
+    def predict_from_pil_image(self, pil_image):
+        """从 PIL 图像推理（兼容反馈截图等场景）"""
+        try:
+            img = np.array(pil_image, dtype=np.float32)
+            img *= self._inv_255
+            buf = self._input_buf[0]
+            buf[0] = img[:, :, 0]  # R
+            buf[1] = img[:, :, 1]  # G
+            buf[2] = img[:, :, 2]  # B
+            logit = self.session.run(None, {"image": self._input_buf})[0]
+            return float(1.0 / (1.0 + np.exp(-logit[0, 0])))
         except Exception as e:
             print(f"❌ 推理失败: {e}")
             return 0.0
@@ -221,12 +240,12 @@ class ScreenshotInferenceThread(threading.Thread):
             while self.running:
                 frame_start = time.perf_counter()
                 screenshot = None
-                img = None
                 try:
                     screenshot = sct.grab(self.capture_region)
-                    img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
-                    probability = self.inference_module.predict_from_pil_image(img)
+                    probability = self.inference_module.predict_from_raw_bgra(
+                        screenshot.bgra, screenshot.width, screenshot.height
+                    )
 
                     self._frame_count += 1
                     current_time = time.time()
@@ -256,11 +275,6 @@ class ScreenshotInferenceThread(threading.Thread):
                 except Exception as e:
                     print(f"截图推理线程出错: {e}")
                 finally:
-                    if img is not None:
-                        try:
-                            img.close()
-                        except:
-                            pass
                     if screenshot is not None:
                         del screenshot
 
