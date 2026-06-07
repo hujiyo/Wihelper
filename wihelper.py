@@ -3,17 +3,21 @@
 """
 WiHelper - 激光射蚊子助手
 多线程版本：实时截图推理 + 判断模式控制
-内存优化版本
+使用 ONNX Runtime 推理，无需 Python + PyTorch 环境
 """
 
 import os
 import sys
+
+# 在 numpy 导入前设置，避免 MKL 多线程 DLL 缺失导致崩溃
+os.environ.setdefault('MKL_THREADING_LAYER', 'SEQUENTIAL')
+
 import time
 import threading
+import configparser
 import numpy as np
 from PIL import Image
 import mss
-import torch
 import win32gui
 import ctypes
 import uuid
@@ -23,7 +27,48 @@ from pynput.keyboard import Controller as KeyboardController, Listener as Keyboa
 import gc
 import signal
 from datetime import datetime
-from train_model import WiHelperCNN
+
+
+# --- 配置文件 ---
+def get_base_dir():
+    """获取程序所在目录（兼容 PyInstaller 打包后的路径）"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def load_config():
+    """加载配置文件，不存在则创建默认配置"""
+    base_dir = get_base_dir()
+    config_path = os.path.join(base_dir, "config.ini")
+
+    config = configparser.ConfigParser()
+
+    defaults = {
+        'threshold': '0.8',
+        'fire_cooldown': '4.0',
+        'model_path': 'wihelper_model.onnx',
+        'target_fps': '60',
+    }
+
+    if os.path.exists(config_path):
+        config.read(config_path, encoding='utf-8')
+        if 'wihelper' not in config:
+            config['wihelper'] = defaults
+        else:
+            for key, default_val in defaults.items():
+                if key not in config['wihelper']:
+                    config['wihelper'][key] = default_val
+    else:
+        config['wihelper'] = defaults
+        try:
+            with open(config_path, 'w', encoding='utf-8') as f:
+                config.write(f)
+            print(f"✓ 已创建默认配置文件: {config_path}")
+        except Exception as e:
+            print(f"⚠️ 创建配置文件失败: {e}")
+
+    return config['wihelper']
 
 
 # 全局变量及锁
@@ -33,94 +78,105 @@ if_dead = 0
 current_result = 0
 
 class OptimizedInferenceModule:
-    """优化的推理模块 - 直接使用120×120输入"""
-    def __init__(self, model_path="models-v1.1-4/best_model.pth", threshold=0.8):
+    """ONNX Runtime 推理模块 - 使用 DirectML GPU 加速，CPU 兜底"""
+    def __init__(self, model_path="wihelper_model.onnx", threshold=0.8):
         self.model_path = model_path
         self.threshold = threshold
-
         self.capture_size = 120
-        self.img_height = 120
-        self.img_width = 120
-
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"🚀 加载模型: {model_path}")
-        print(f"   设备: {self.device}")
-
-        np.random.seed(42)
-        torch.manual_seed(42)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(42)
 
         self._reuse_buffer = None
-        self.load_model()
+        self._load_model()
         self._warmup_model()
 
-    def load_model(self):
-        """加载模型"""
-        try:
-            if not os.path.exists(self.model_path):
-                print(f"❌ 模型文件不存在: {self.model_path}")
+    def _load_model(self):
+        """加载 ONNX 模型"""
+        import onnxruntime as ort
+
+        base_dir = get_base_dir()
+        abs_model_path = os.path.join(base_dir, self.model_path)
+        if not os.path.exists(abs_model_path):
+            # 尝试作为绝对路径
+            if os.path.exists(self.model_path):
+                abs_model_path = self.model_path
+            else:
+                print(f"❌ 模型文件不存在: {abs_model_path}")
+                print(f"   也未找到: {self.model_path}")
                 sys.exit(1)
 
-            print(f"📦 加载模型: {self.model_path}")
-            self.model = WiHelperCNN()
-            state_dict = torch.load(self.model_path, map_location=self.device, weights_only=True)
-            self.model.load_state_dict(state_dict)
-            self.model.to(self.device)
-            self.model.eval()
-            print("✅ 模型加载完成！")
+        self.model_path = abs_model_path
+        print(f"🚀 加载 ONNX 模型: {self.model_path}")
 
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.intra_op_num_threads = 4
+        sess_options.inter_op_num_threads = 1
+
+        # DirectML 优先 → CPU 兜底
+        available_providers = ort.get_available_providers()
+        providers = []
+        if 'DmlExecutionProvider' in available_providers:
+            providers.append('DmlExecutionProvider')
+        if 'CUDAExecutionProvider' in available_providers:
+            providers.append('CUDAExecutionProvider')
+        providers.append('CPUExecutionProvider')
+
+        try:
+            self.session = ort.InferenceSession(
+                self.model_path, sess_options=sess_options, providers=providers
+            )
         except Exception as e:
-            print(f"❌ 模型加载失败: {e}")
-            sys.exit(1)
+            print(f"⚠️ GPU 加载失败，回退 CPU: {e}")
+            self.session = ort.InferenceSession(
+                self.model_path, sess_options=sess_options, providers=['CPUExecutionProvider']
+            )
+
+        active_provider = self.session.get_providers()[0]
+        provider_name = {
+            'DmlExecutionProvider': 'DirectML (GPU)',
+            'CUDAExecutionProvider': 'CUDA (GPU)',
+            'CPUExecutionProvider': 'CPU',
+        }.get(active_provider, active_provider)
+
+        print(f"✅ 模型加载完成！执行提供者: {provider_name}")
 
     def _warmup_model(self):
         """预热模型"""
         print("🔥 预热模型...")
         try:
-            for _ in range(3):
-                dummy_image = np.random.randint(0, 255, (self.img_height, self.img_width, 3), dtype=np.uint8)
-                processed = self._fast_preprocess(dummy_image)
-                with torch.no_grad():
-                    self.model(processed)
-                del dummy_image
+            for _ in range(5):
+                dummy = np.random.randint(0, 255, (120, 120, 3), dtype=np.uint8)
+                _ = self.predict_from_pil_image(Image.fromarray(dummy))
         except Exception as e:
-            print(f"⚠️ 预热过程中出错: {e}")
+            print(f"⚠️ 预热出错: {e}")
         print("✓ 模型预热完成")
 
-    def _fast_preprocess(self, image_array):
-        """优化的快速预处理"""
-        img_float = image_array.astype(np.float32) * (1.0 / 255.0)
-        # HWC -> CHW
-        img_chw = np.transpose(img_float, (2, 0, 1))
-
-        if self._reuse_buffer is None:
-            self._reuse_buffer = np.expand_dims(img_chw, axis=0)
-        else:
-            self._reuse_buffer[0] = img_chw
-
-        return torch.from_numpy(self._reuse_buffer).to(self.device)
-
     def predict_from_pil_image(self, pil_image):
-        """从PIL图像进行推理"""
+        """从 PIL 图像进行推理"""
         try:
-            image_array = np.array(pil_image)
-            processed_image = self._fast_preprocess(image_array)
+            image_array = np.ascontiguousarray(pil_image, dtype=np.float32)
+            image_array *= (1.0 / 255.0)
 
-            with torch.no_grad():
-                output = self.model(processed_image)
-                probability = torch.sigmoid(output).item()
+            # HWC -> CHW -> NCHW，复用 buffer 减少分配
+            img_chw = np.transpose(image_array, (2, 0, 1))
+            if self._reuse_buffer is None or self._reuse_buffer.shape != (1, 3, 120, 120):
+                self._reuse_buffer = np.expand_dims(img_chw, axis=0)
+            else:
+                self._reuse_buffer[0] = img_chw
 
-            return probability
+            logit = self.session.run(None, {"image": self._reuse_buffer})[0]
+            probability = 1.0 / (1.0 + np.exp(-logit[0, 0]))  # sigmoid
+
+            return float(probability)
         except Exception as e:
             print(f"❌ 推理失败: {e}")
             return 0.0
 
 class ScreenshotInferenceThread(threading.Thread):
     """截图推理线程"""
-    def __init__(self, inference_module):
+    def __init__(self, inference_module, target_fps=60):
         super().__init__()
         self.inference_module = inference_module
+        self.target_fps = max(1, min(target_fps, 240))  # 限制在 1~240 FPS
         self.running = True
         self.screenshot_lock = threading.Lock()
         self.current_screenshot = None
@@ -135,7 +191,7 @@ class ScreenshotInferenceThread(threading.Thread):
     def _precompute_capture_region(self):
         size = self.inference_module.capture_size
 
-        with mss.mss() as sct:
+        with mss.MSS() as sct:
             monitor = sct.monitors[0]
             center_x = monitor["width"] // 2
             center_y = monitor["height"] // 2
@@ -158,8 +214,8 @@ class ScreenshotInferenceThread(threading.Thread):
             }
 
     def run(self):
-        sct = mss.mss()
-        target_frame_time = 1.0 / 60.0  # 目标60FPS
+        sct = mss.MSS()
+        target_frame_time = 1.0 / self.target_fps
 
         try:
             while self.running:
@@ -421,7 +477,7 @@ class FeedbackCollector:
 
 class WiHelper:
     """激光射蚊子助手主类"""
-    def __init__(self, fire_cooldown=4.0):
+    def __init__(self, fire_cooldown=4.0, model_path="wihelper_model.onnx", threshold=0.8, target_fps=60):
         self.judging_mode = False
         self.judging_start_time = 0
         self.right_mouse_pressed = False
@@ -436,8 +492,10 @@ class WiHelper:
 
         self.fire_cooldown = fire_cooldown
 
-        self.inference_module = OptimizedInferenceModule()
-        self.screenshot_thread = ScreenshotInferenceThread(self.inference_module)
+        self.inference_module = OptimizedInferenceModule(
+            model_path=model_path, threshold=threshold
+        )
+        self.screenshot_thread = ScreenshotInferenceThread(self.inference_module, target_fps=target_fps)
         self.screenshot_thread.start()
 
         self.feedback_collector = FeedbackCollector()
@@ -654,82 +712,39 @@ class WiHelper:
         if self.keyboard_listener:
             self.keyboard_listener.stop()
 
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            print("✓ GPU缓存已清理")
-        except Exception as e:
-            print(f"⚠️ GPU清理失败: {e}")
-
         gc.collect()
         print("✅ 清理完成")
 
 def main():
-    import sys
-
     # 优先注册SIGINT处理器，防止Intel Fortran运行时拦截Ctrl+C
     def _sigint_handler(sig, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGINT, _sigint_handler)
 
-    print(f"PyTorch 版本: {torch.__version__}")
-    print(f"CUDA 可用: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"CUDA 设备: {torch.cuda.get_device_name(0)}")
-    else:
-        print("\n✗ 未检测到CUDA GPU，无法继续！")
-        print("  请确认:")
-        print("  1. 已安装 NVIDIA 显卡驱动")
-        print("  2. 已安装 CUDA Toolkit")
-        print("  3. 已安装对应版本的 PyTorch")
-        sys.exit(1)
-
     print("=" * 60)
-    print("🎯 WiHelper激光射蚊子助手 - 启动配置")
+    print("🎯 WiHelper 激光射蚊子助手")
     print("=" * 60)
-    print()
-    print("请设置开枪延迟时间（每一枪之间的时间间隔）：")
-    print("  - 直接按回车: 使用默认4秒（大狙模式，一枪后自动退出瞄准）")
-    print("  - 输入数字: 自定义延迟时间（例如：0.2 表示每0.2秒一枪，连狙模式）")
-    print()
-    print("💡 说明:")
-    print("  - 延迟 >= 4秒: 大狙模式，第一枪后因为延迟长会超时退出")
-    print("  - 延迟 < 4秒: 连狙模式，4秒内最多连续射击8枪")
-    print()
 
-    fire_cooldown = 4.0
+    # 加载配置
+    config = load_config()
+    threshold = float(config['threshold'])
+    fire_cooldown = float(config['fire_cooldown'])
+    model_path = config['model_path']
+    target_fps = int(config['target_fps'])
 
-    try:
-        user_input = input("请输入延迟时间（秒）或直接回车使用默认值: ").strip()
-
-        if user_input == "":
-            print(f"✓ 使用默认延迟: {fire_cooldown}秒（大狙模式）")
-        else:
-            try:
-                fire_cooldown = float(user_input)
-                if fire_cooldown <= 0:
-                    print("⚠️ 延迟时间必须大于0，使用默认值4秒")
-                    fire_cooldown = 4.0
-                elif fire_cooldown > 10:
-                    print("⚠️ 延迟时间过长（>10秒），使用默认值4秒")
-                    fire_cooldown = 4.0
-                else:
-                    if fire_cooldown >= 4.0:
-                        print(f"✓ 已设置延迟: {fire_cooldown}秒（大狙模式）")
-                    else:
-                        print(f"✓ 已设置延迟: {fire_cooldown}秒（连狙模式）")
-            except ValueError:
-                print("⚠️ 输入格式错误，使用默认值4秒")
-                fire_cooldown = 4.0
-    except Exception as e:
-        print(f"⚠️ 输入错误: {e}，使用默认值4秒")
-        fire_cooldown = 4.0
-
-    print()
-    print("=" * 60)
+    print(f"⚙️  配置:")
+    print(f"   模型路径: {model_path}")
+    print(f"   检测阈值: {threshold}")
+    print(f"   开枪延迟: {fire_cooldown}秒")
+    print(f"   目标帧率: {target_fps} FPS")
     print()
 
-    helper = WiHelper(fire_cooldown=fire_cooldown)
+    helper = WiHelper(
+        fire_cooldown=fire_cooldown,
+        model_path=model_path,
+        threshold=threshold,
+        target_fps=target_fps,
+    )
     helper.run()
 
 if __name__ == "__main__":

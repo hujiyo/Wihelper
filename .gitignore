@@ -6,3 +6,9 @@ __pycache__/
 .vs/
 *-plus.py
 log
+build/
+dist/
+.build_env/
+.claude/
+.claude/settings.local.json
+*.onnx
