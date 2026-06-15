@@ -273,7 +273,8 @@ class ScreenshotInferenceThread(threading.Thread):
                         time.sleep(sleep_time)
 
                 except Exception as e:
-                    print(f"截图推理线程出错: {e}")
+                    # BitBlt 等间歇性截图错误静默跳过，不影响运行
+                    pass
                 finally:
                     if screenshot is not None:
                         del screenshot
