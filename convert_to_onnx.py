@@ -147,7 +147,7 @@ def benchmark(onnx_path, num_runs=200):
 
 def main():
     parser = argparse.ArgumentParser(description="PyTorch → ONNX 模型转换工具")
-    parser.add_argument("--model", default="models-v1.1-4/best_model.pth", help="PyTorch 模型路径")
+    parser.add_argument("--model", default="models/best_model.pth", help="PyTorch 模型路径")
     parser.add_argument("--output", default="wihelper_model.onnx", help="ONNX 输出路径")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset 版本")
     parser.add_argument("--skip-verify", action="store_true", help="跳过一致性验证")

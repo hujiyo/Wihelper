@@ -38,31 +38,23 @@ class WiHelperCNN(nn.Module):
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
-        # Block 3: dilation=4, 感受野 13→21→29
-        self.block3 = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=4, dilation=4),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, 3, padding=4, dilation=4),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-        )
-        # 中心92×92 → 压缩到 12×12
+        # Block 3 已删除: RF=13 足够中心任务, 中心裁剪扩大到 108×108 用满干净区域
+        # 中心108×108 → 压缩到 14×14
         self.compress = nn.Sequential(
-            nn.Conv2d(64, 64, 3, stride=2, padding=1),
+            nn.Conv2d(64, 64, 3, stride=2, padding=1),   # 108→54
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 32, 3, stride=2, padding=1),
+            nn.Conv2d(64, 32, 3, stride=2, padding=1),   # 54→27
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 32, 3, stride=2, padding=1),
+            nn.Conv2d(32, 32, 3, stride=2, padding=1),   # 27→14
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
         )
-        # 分类头 12×12×32 = 4608
+        # 分类头 14×14×32 = 6272
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(4608, 256),
+            nn.Linear(6272, 256),
             nn.ReLU(inplace=True),
             nn.BatchNorm1d(256),
             nn.Dropout(0.3),
@@ -72,12 +64,11 @@ class WiHelperCNN(nn.Module):
     def forward(self, x):
         x = self.block1(x)   # [B, 32, 120, 120]
         x = self.block2(x)   # [B, 64, 120, 120]
-        x = self.block3(x)   # [B, 64, 120, 120]
-        # 中心裁剪64×64
-        h = (x.shape[2] - 92) // 2
-        w = (x.shape[3] - 92) // 2
-        x = x[:, :, h:h+92, w:w+92]  # [B, 64, 92, 92]
-        x = self.compress(x)    # [B, 32, 8, 8]
+        # 中心裁剪108×108: 去掉外圈6像素(RF=13, 半径6), 感受野完全在原图内
+        h = (x.shape[2] - 108) // 2
+        w = (x.shape[3] - 108) // 2
+        x = x[:, :, h:h+108, w:w+108]  # [B, 64, 108, 108]
+        x = self.compress(x)    # [B, 32, 14, 14]
         x = self.classifier(x)  # [B, 1]
         return x
 
@@ -485,14 +476,30 @@ class WiHelperTrainer:
         print("  - 指标: Accuracy, AUC")
         print("\n开始训练 (每轮显示进度和测试评估)...")
 
-        optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+        # AdamW 解耦式 weight decay, BN 参数和 bias 不加
         warmup_epochs = 5
         initial_lr = 1e-4
         peak_lr = 3e-4
         min_lr = 1e-6
         accumulation_steps = 4
-        patience = 15
-        patience_counter = 0
+        weight_decay = 1e-2
+
+        decay_params, no_decay_params = [], []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param.ndim <= 1 or name.endswith(".bias"):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+        optimizer = optim.AdamW(
+            [
+                {"params": decay_params,    "weight_decay": weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
+            lr=1e-4,
+        )
+        print(f"  - 优化器: AdamW (lr=1e-4, weight_decay={weight_decay}, BN/bias 不加 wd)")
 
         history = {
             'loss': [], 'accuracy': [], 'auc': [],
@@ -587,14 +594,8 @@ class WiHelperTrainer:
                 if test_tac > best_tac:
                     best_tac = test_tac
                     best_epoch = epoch + 1
-                    patience_counter = 0
                     best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                     print(f"✓ 发现更好的模型 (战术得分: {test_tac:.4f}, AUC: {test_auc:.4f})，已暂存到内存")
-                else:
-                    patience_counter += 1
-                    if patience_counter >= patience:
-                        print(f"早停: 战术得分在{patience}轮内没有提升")
-                        break
 
         # 保存模型
         print("\n保存模型到磁盘...")
