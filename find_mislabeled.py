@@ -13,12 +13,19 @@ import torch
 from PIL import Image
 from train_model import WiHelperCNN, preprocess, find_best_model
 
+from config import (
+    DataConfig,
+    DeviceConfig,
+    InferenceConfig,
+    PathsConfig,
+)
+
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="查找训练集中模型预测与人工标注不一致的样本")
     parser.add_argument("--uncertain", action="store_true",
-                        help="同时提取预测概率在 0.2~0.8 之间的不确定样本")
+                        help=f"同时提取预测概率在 {InferenceConfig.UNCERTAIN_LOW}~{InferenceConfig.UNCERTAIN_HIGH} 之间的不确定样本")
     args = parser.parse_args()
 
     model_path = find_best_model()
@@ -27,7 +34,7 @@ def main():
         sys.exit(1)
 
     print(f"加载模型: {model_path}")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = DeviceConfig.get_device(require_cuda=False)
     model = WiHelperCNN()
     state_dict = torch.load(model_path, map_location=device, weights_only=True)
     model.load_state_dict(state_dict)
@@ -35,16 +42,13 @@ def main():
     model.eval()
     print(f"设备: {device}")
     if args.uncertain:
-        print("模式: 不一致 + 不确定(0.2~0.8)")
+        print(f"模式: 不一致 + 不确定({InferenceConfig.UNCERTAIN_LOW}~{InferenceConfig.UNCERTAIN_HIGH})")
 
-    threshold = 0.5
-    out_dir = "image"
+    threshold = InferenceConfig.DEFAULT_TRAIN_THRESHOLD
+    out_dir = PathsConfig.MISLABELED_OUT_DIR
     os.makedirs(out_dir, exist_ok=True)
 
-    folders = {
-        "image/train/got": 1,      # 人工标注: 有目标
-        "image/train/nogot": 0,     # 人工标注: 无目标
-    }
+    folders = PathsConfig.MISLABELED_FOLDERS
 
     total = 0
     mismatch = 0
@@ -57,7 +61,7 @@ def main():
             continue
 
         files = [f for f in os.listdir(folder)
-                 if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+                 if f.lower().endswith(DataConfig.SUPPORTED_EXT)]
         label_name = "有目标(got)" if true_label == 1 else "无目标(nogot)"
         print(f"\n扫描 {folder}/ ({len(files)} 张, 标签={label_name})")
 
@@ -76,7 +80,10 @@ def main():
             pred_label = 1 if prob >= threshold else 0
 
             is_mismatch = pred_label != true_label
-            is_uncertain = args.uncertain and 0.2 <= prob <= 0.8
+            is_uncertain = (
+                args.uncertain
+                and InferenceConfig.UNCERTAIN_LOW <= prob <= InferenceConfig.UNCERTAIN_HIGH
+            )
 
             if is_mismatch:
                 mismatch += 1
@@ -96,7 +103,7 @@ def main():
     print(f"\n{'='*50}")
     print(f"扫描完成: 共 {total} 张, 不一致 {mismatch} 张 ({mismatch/total*100:.1f}%)")
     if args.uncertain:
-        print(f"不确定(0.2~0.8): {uncertain_count} 张 ({uncertain_count/total*100:.1f}%)")
+        print(f"不确定({InferenceConfig.UNCERTAIN_LOW}~{InferenceConfig.UNCERTAIN_HIGH}): {uncertain_count} 张 ({uncertain_count/total*100:.1f}%)")
     print(f"合计标记: {flagged} 张 ({flagged/total*100:.1f}%)")
     print(f"{'='*50}")
 

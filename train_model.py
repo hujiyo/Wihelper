@@ -3,6 +3,7 @@
 #模型训练脚本 - 训练CNN模型来识别是否有目标
 
 import os
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,6 +15,15 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import cv2
 
+from config import (
+    DataConfig,
+    LossConfig,
+    ModelConfig,
+    PathsConfig,
+    TrainingConfig,
+    DeviceConfig,
+)
+
 
 class WiHelperCNN(nn.Module):
     """空洞卷积版 - 全程保持空间分辨率，中心裁剪后压缩"""
@@ -22,58 +32,63 @@ class WiHelperCNN(nn.Module):
         # 空洞卷积特征提取: 120×120 全程不变
         # Block 1: dilation=1, 感受野 3→5
         self.block1 = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(ModelConfig.BLOCK1_IN_CHANNELS, ModelConfig.BLOCK1_OUT_CHANNELS, 3, padding=1),
+            nn.BatchNorm2d(ModelConfig.BLOCK1_OUT_CHANNELS),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(ModelConfig.BLOCK1_OUT_CHANNELS, ModelConfig.BLOCK1_OUT_CHANNELS, 3, padding=1),
+            nn.BatchNorm2d(ModelConfig.BLOCK1_OUT_CHANNELS),
             nn.ReLU(inplace=True),
         )
         # Block 2: dilation=2, 感受野 5→9→13
         self.block2 = nn.Sequential(
-            nn.Conv2d(32, 64, 3, padding=2, dilation=2),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(ModelConfig.BLOCK2_IN_CHANNELS, ModelConfig.BLOCK2_OUT_CHANNELS, 3, padding=2, dilation=2),
+            nn.BatchNorm2d(ModelConfig.BLOCK2_OUT_CHANNELS),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, 3, padding=2, dilation=2),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(ModelConfig.BLOCK2_OUT_CHANNELS, ModelConfig.BLOCK2_OUT_CHANNELS, 3, padding=2, dilation=2),
+            nn.BatchNorm2d(ModelConfig.BLOCK2_OUT_CHANNELS),
             nn.ReLU(inplace=True),
         )
         # Block 3 已删除: RF=13 足够中心任务, 中心裁剪扩大到 108×108 用满干净区域
         # 中心108×108 → 压缩到 14×14
+        c0, c1, c2 = ModelConfig.COMPRESS_CHANNELS
+        s = ModelConfig.COMPRESS_STRIDE
         self.compress = nn.Sequential(
-            nn.Conv2d(64, 64, 3, stride=2, padding=1),   # 108→54
-            nn.BatchNorm2d(64),
+            nn.Conv2d(ModelConfig.BLOCK2_OUT_CHANNELS, c0, 3, stride=s, padding=1),   # 108→54
+            nn.BatchNorm2d(c0),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 32, 3, stride=2, padding=1),   # 54→27
-            nn.BatchNorm2d(32),
+            nn.Conv2d(c0, c1, 3, stride=s, padding=1),   # 54→27
+            nn.BatchNorm2d(c1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 32, 3, stride=2, padding=1),   # 27→14
-            nn.BatchNorm2d(32),
+            nn.Conv2d(c1, c2, 3, stride=s, padding=1),   # 27→14
+            nn.BatchNorm2d(c2),
             nn.ReLU(inplace=True),
         )
         # 分类头 14×14×32 = 6272
+        # 中心 108×108 经三次 stride=2 压缩: ceil(108/8) = 14
+        feat_h = math.ceil(ModelConfig.CENTER_CROP_SIZE / (s ** 3))
+        flatten_dim = c2 * feat_h * feat_h
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(6272, 256),
+            nn.Linear(flatten_dim, ModelConfig.CLASSIFIER_HIDDEN),
             nn.ReLU(inplace=True),
-            nn.BatchNorm1d(256),
-            nn.Dropout(0.3),
-            nn.Linear(256, 1),
+            nn.BatchNorm1d(ModelConfig.CLASSIFIER_HIDDEN),
+            nn.Dropout(ModelConfig.CLASSIFIER_DROPOUT),
+            nn.Linear(ModelConfig.CLASSIFIER_HIDDEN, ModelConfig.NUM_CLASSES),
         )
 
     def forward(self, x):
         x = self.block1(x)   # [B, 32, 120, 120]
         x = self.block2(x)   # [B, 64, 120, 120]
         # 中心裁剪108×108: 去掉外圈6像素(RF=13, 半径6), 感受野完全在原图内
-        h = (x.shape[2] - 108) // 2
-        w = (x.shape[3] - 108) // 2
-        x = x[:, :, h:h+108, w:w+108]  # [B, 64, 108, 108]
+        h = (x.shape[2] - ModelConfig.CENTER_CROP_SIZE) // 2
+        w = (x.shape[3] - ModelConfig.CENTER_CROP_SIZE) // 2
+        x = x[:, :, h:h+ModelConfig.CENTER_CROP_SIZE, w:w+ModelConfig.CENTER_CROP_SIZE]  # [B, 64, 108, 108]
         x = self.compress(x)    # [B, 32, 14, 14]
         x = self.classifier(x)  # [B, 1]
         return x
 
 
-def center_crop(img, size=120):
+def center_crop(img, size=DataConfig.TARGET_SIDE_LENGTH):
     """中心裁剪 numpy 图像"""
     h, w = img.shape[:2]
     ch = (h - size) // 2
@@ -87,7 +102,7 @@ def preprocess(path):
     if img is None:
         return None
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = center_crop(img, 120)
+    img = center_crop(img, DataConfig.TARGET_SIDE_LENGTH)
     img = img.astype(np.float32) / 255.0
     img = np.transpose(img, (2, 0, 1))
     return torch.from_numpy(img).unsqueeze(0)
@@ -95,11 +110,10 @@ def preprocess(path):
 
 def find_best_model():
     """自动查找 best 模型文件"""
-    candidates = ["models/best_model.pth", "models-v1.1-4/best_model.pth"]
-    for p in candidates:
+    for p in PathsConfig.BEST_MODEL_CANDIDATES:
         if os.path.exists(p):
             return p
-    for d in ["models", "models-v1.1-4"]:
+    for d in PathsConfig.BEST_MODEL_DIRS:
         if os.path.isdir(d):
             for f in os.listdir(d):
                 if "best" in f.lower() and f.endswith(".pth"):
@@ -107,7 +121,12 @@ def find_best_model():
     return None
 
 
-def tactical_score(y_true, y_pred_prob, threshold=0.5, fp_penalty=5.0):
+def tactical_score(
+    y_true,
+    y_pred_prob,
+    threshold=LossConfig.TEST_THRESHOLD,
+    fp_penalty=LossConfig.TACTICAL_FP_PENALTY,
+):
     """
     战术得分: 每次正确检出 +1 分, 每次误报扣 fp_penalty 分
     归一化: score = (TP - fp_penalty * FP) / 实际目标总数
@@ -136,6 +155,7 @@ def print_training_progress(epoch, total_epochs, logs, test_loader=None, model=N
         test_correct = 0
         test_total = 0
         criterion = nn.BCEWithLogitsLoss(reduction='none')
+        test_threshold = LossConfig.TEST_THRESHOLD
 
         with torch.no_grad():
             for images, labels in test_loader:
@@ -147,13 +167,13 @@ def print_training_progress(epoch, total_epochs, logs, test_loader=None, model=N
                 probs = torch.sigmoid(outputs)
                 all_probs.extend(probs.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
-                preds = (probs > 0.5).float()
+                preds = (probs > test_threshold).float()
                 test_correct += (preds == labels).sum().item()
                 test_total += labels.size(0)
 
         y_true = np.array(all_labels)
         y_pred_prob = np.array(all_probs)
-        y_pred = (y_pred_prob > 0.5).astype(int)
+        y_pred = (y_pred_prob > test_threshold).astype(int)
 
         test_loss = test_loss_total / test_total
         test_accuracy = test_correct / test_total
@@ -161,7 +181,7 @@ def print_training_progress(epoch, total_epochs, logs, test_loader=None, model=N
             test_auc = roc_auc_score(y_true, y_pred_prob)
         except ValueError:
             test_auc = 0.0
-        test_tac = tactical_score(y_true, y_pred_prob)
+        test_tac = tactical_score(y_true, y_pred_prob, threshold=test_threshold)
 
         print(f"测试损失: {test_loss:.4f} - 测试准确率: {test_accuracy:.4f} - AUC: {test_auc:.4f} - 战术得分: {test_tac:.4f}")
 
@@ -179,7 +199,7 @@ def print_training_progress(epoch, total_epochs, logs, test_loader=None, model=N
         for idx in sample_indices:
             true_label = int(y_true[idx])
             pred_prob = y_pred_prob[idx]
-            pred_class = 1 if pred_prob > 0.5 else 0
+            pred_class = 1 if pred_prob > test_threshold else 0
             status = "✓" if true_label == pred_class else "✗"
             print(f"{idx:6d}\t{true_label}\t\t{pred_prob:.4f}\t\t{pred_class}\t\t{status}")
         print("-" * 50)
@@ -190,7 +210,7 @@ def print_training_progress(epoch, total_epochs, logs, test_loader=None, model=N
 
 class CenterCrop:
     """中心裁剪 144→120"""
-    def __init__(self, crop_size=120):
+    def __init__(self, crop_size=DataConfig.TARGET_SIDE_LENGTH):
         self.crop_size = crop_size
 
     def __call__(self, img):
@@ -205,13 +225,13 @@ class TrainDataset(datasets.ImageFolder):
     """训练数据集 - 使用 OpenCV 读取以支持 CenterCrop 后再增强"""
     # ImageFolder 按字母排序: got=0, nogot=1
     # 但我们需要 nogot=0, got=1 (与原始 TF 代码一致: got=1 表示有目标)
-    LABEL_MAP = {'got': 1, 'nogot': 0}
+    LABEL_MAP = DataConfig.LABEL_MAP
 
-    def __init__(self, root, transform_pil, target_size=(120, 120)):
+    def __init__(self, root, transform_pil, target_size=(DataConfig.TARGET_SIDE_LENGTH, DataConfig.TARGET_SIDE_LENGTH)):
         super().__init__(root)
         self.transform_pil = transform_pil
         self.target_size = target_size
-        self.center_crop = CenterCrop(120)
+        self.center_crop = CenterCrop(DataConfig.TARGET_SIDE_LENGTH)
 
     def __getitem__(self, index):
         path, label = self.samples[index]
@@ -228,26 +248,24 @@ class TrainDataset(datasets.ImageFolder):
 
 
 class WiHelperTrainer:
-    def __init__(self, data_dir="image", model_save_dir="models"):
+    def __init__(self, data_dir=DataConfig.DATA_DIR, model_save_dir=PathsConfig.MODEL_SAVE_DIR):
         self.data_dir = data_dir
         self.model_save_dir = model_save_dir
-        self.raw_height = 144
-        self.raw_width = 144
-        self.img_height = 120
-        self.img_width = 120
-        self.batch_size = 32
-        self.batches_per_epoch = 100
-        self.epochs = 50
+        self.img_height = DataConfig.TARGET_SIDE_LENGTH
+        self.img_width = DataConfig.TARGET_SIDE_LENGTH
+        self.batch_size = TrainingConfig.BATCH_SIZE
+        self.batches_per_epoch = TrainingConfig.BATCHES_PER_EPOCH
+        self.epochs = TrainingConfig.EPOCHS
 
         os.makedirs(model_save_dir, exist_ok=True)
 
-        # 设备
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # 设备（训练要求 CUDA）
+        self.device = DeviceConfig.get_device(require_cuda=True)
 
-        np.random.seed(42)
-        torch.manual_seed(42)
+        np.random.seed(TrainingConfig.NP_SEED)
+        torch.manual_seed(TrainingConfig.TORCH_SEED)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed(42)
+            torch.cuda.manual_seed(TrainingConfig.TORCH_SEED)
 
     def create_model(self):
         print("\n" + "=" * 40)
@@ -259,21 +277,24 @@ class WiHelperTrainer:
         return model
 
     def add_noise_and_blur(self, image):
-        enhancement_type = np.random.choice(['noise', 'blur', 'none'], p=[0.3, 0.3, 0.4])
+        enhancement_type = np.random.choice(
+            ['noise', 'blur', 'none'],
+            p=TrainingConfig.AUG_PROBS,
+        )
         if enhancement_type == 'noise':
-            noise = np.random.normal(0, 5, image.shape).astype(np.uint8)
+            noise = np.random.normal(0, TrainingConfig.NOISE_STD, image.shape).astype(np.uint8)
             image = cv2.add(image.astype(np.uint8), noise)
         elif enhancement_type == 'blur':
-            ksize = np.random.choice([3, 5])
+            ksize = np.random.choice(TrainingConfig.BLUR_KSIZES)
             image = cv2.GaussianBlur(image.astype(np.uint8), (ksize, ksize), 0)
         return image.astype(np.float32)
 
     def compute_class_weights(self):
-        train_dir = os.path.join(self.data_dir, 'train')
-        nogot_count = len([f for f in os.listdir(os.path.join(train_dir, 'nogot'))
-                          if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-        got_count = len([f for f in os.listdir(os.path.join(train_dir, 'got'))
-                        if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        train_dir = os.path.join(self.data_dir, DataConfig.TRAIN_DIR)
+        nogot_count = len([f for f in os.listdir(os.path.join(train_dir, DataConfig.NOGOT_DIR))
+                          if f.lower().endswith(DataConfig.SUPPORTED_EXT)])
+        got_count = len([f for f in os.listdir(os.path.join(train_dir, DataConfig.GOT_DIR))
+                        if f.lower().endswith(DataConfig.SUPPORTED_EXT)])
         total_samples = nogot_count + got_count
 
         if total_samples == 0:
@@ -301,12 +322,12 @@ class WiHelperTrainer:
         ])
 
         train_dataset = TrainDataset(
-            os.path.join(self.data_dir, 'train'),
+            os.path.join(self.data_dir, DataConfig.TRAIN_DIR),
             transform_pil=train_transform,
             target_size=(self.img_height, self.img_width),
         )
         test_dataset = TrainDataset(
-            os.path.join(self.data_dir, 'test'),
+            os.path.join(self.data_dir, DataConfig.TEST_DIR),
             transform_pil=test_transform,
             target_size=(self.img_height, self.img_width),
         )
@@ -326,15 +347,15 @@ class WiHelperTrainer:
             train_dataset,
             batch_size=self.batch_size,
             sampler=sampler,
-            num_workers=0,
-            pin_memory=True if torch.cuda.is_available() else False,
+            num_workers=TrainingConfig.NUM_WORKERS,
+            pin_memory=TrainingConfig.PIN_MEMORY and torch.cuda.is_available(),
         )
         test_loader = DataLoader(
             test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=0,
-            pin_memory=True if torch.cuda.is_available() else False,
+            num_workers=TrainingConfig.NUM_WORKERS,
+            pin_memory=TrainingConfig.PIN_MEMORY and torch.cuda.is_available(),
         )
 
         # 注意: ImageFolder 原始映射是 {'got':0, 'nogot':1}
@@ -343,7 +364,7 @@ class WiHelperTrainer:
         return train_loader, test_loader
 
     def save_complete_info(self, model, history, accuracy, class_report):
-        info_path = os.path.join(self.model_save_dir, 'info.txt')
+        info_path = os.path.join(self.model_save_dir, PathsConfig.TRAIN_INFO_FILENAME)
         with open(info_path, 'w', encoding='utf-8') as f:
             f.write("基本信息:\n")
             f.write(f"训练日期: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -413,7 +434,7 @@ class WiHelperTrainer:
 
         y_true = np.array(all_labels)
         y_pred_prob = np.array(all_probs)
-        y_pred = (y_pred_prob > 0.5).astype(int)
+        y_pred = (y_pred_prob > LossConfig.TEST_THRESHOLD).astype(int)
 
         class_names = ['无目标', '有目标']
         report = classification_report(y_true, y_pred, target_names=class_names)
@@ -439,7 +460,7 @@ class WiHelperTrainer:
         plt.tight_layout()
         plt.ylabel('真实标签')
         plt.xlabel('预测标签')
-        plt.savefig(os.path.join(self.model_save_dir, 'confusion_matrix.png'), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(self.model_save_dir, PathsConfig.CONFUSION_MATRIX_FILENAME), dpi=300, bbox_inches='tight')
         plt.close()
         return accuracy, report
 
@@ -477,12 +498,12 @@ class WiHelperTrainer:
         print("\n开始训练 (每轮显示进度和测试评估)...")
 
         # AdamW 解耦式 weight decay, BN 参数和 bias 不加
-        warmup_epochs = 5
-        initial_lr = 1e-4
-        peak_lr = 3e-4
-        min_lr = 1e-6
-        accumulation_steps = 4
-        weight_decay = 1e-2
+        warmup_epochs = TrainingConfig.WARMUP_EPOCHS
+        initial_lr = TrainingConfig.INITIAL_LR
+        peak_lr = TrainingConfig.PEAK_LR
+        min_lr = TrainingConfig.MIN_LR
+        accumulation_steps = TrainingConfig.ACCUMULATION_STEPS
+        weight_decay = TrainingConfig.WEIGHT_DECAY
 
         decay_params, no_decay_params = [], []
         for name, param in model.named_parameters():
@@ -497,9 +518,9 @@ class WiHelperTrainer:
                 {"params": decay_params,    "weight_decay": weight_decay},
                 {"params": no_decay_params, "weight_decay": 0.0},
             ],
-            lr=1e-4,
+            lr=initial_lr,
         )
-        print(f"  - 优化器: AdamW (lr=1e-4, weight_decay={weight_decay}, BN/bias 不加 wd)")
+        print(f"  - 优化器: AdamW (lr={initial_lr}, weight_decay={weight_decay}, BN/bias 不加 wd)")
 
         history = {
             'loss': [], 'accuracy': [], 'auc': [],
@@ -546,7 +567,7 @@ class WiHelperTrainer:
                 # 累积指标
                 with torch.no_grad():
                     probs = torch.sigmoid(outputs)
-                    preds = (probs > 0.5).float()
+                    preds = (probs > LossConfig.TEST_THRESHOLD).float()
                     epoch_correct += (preds == labels).sum().item()
                     epoch_total += labels.size(0)
                     epoch_loss += loss.item() * accumulation_steps
@@ -599,16 +620,16 @@ class WiHelperTrainer:
 
         # 保存模型
         print("\n保存模型到磁盘...")
-        torch.save(model.state_dict(), os.path.join(self.model_save_dir, 'final_model.pth'))
-        print("✓ 最终模型已保存 (final_model.pth)")
+        torch.save(model.state_dict(), os.path.join(self.model_save_dir, PathsConfig.FINAL_MODEL_FILENAME))
+        print(f"✓ 最终模型已保存 ({PathsConfig.FINAL_MODEL_FILENAME})")
 
         if best_state_dict is not None:
             model.load_state_dict(best_state_dict)
-            torch.save(model.state_dict(), os.path.join(self.model_save_dir, 'best_model.pth'))
-            print(f"✓ 最佳模型已保存 (best_model.pth, 来自第{best_epoch}轮, 战术得分: {best_tac:.4f})")
+            torch.save(model.state_dict(), os.path.join(self.model_save_dir, PathsConfig.BEST_MODEL_FILENAME))
+            print(f"✓ 最佳模型已保存 ({PathsConfig.BEST_MODEL_FILENAME}, 来自第{best_epoch}轮, 战术得分: {best_tac:.4f})")
         else:
-            torch.save(model.state_dict(), os.path.join(self.model_save_dir, 'best_model.pth'))
-            print("✓ 最佳模型已保存 (best_model.pth, 与最终模型相同)")
+            torch.save(model.state_dict(), os.path.join(self.model_save_dir, PathsConfig.BEST_MODEL_FILENAME))
+            print(f"✓ 最佳模型已保存 ({PathsConfig.BEST_MODEL_FILENAME}, 与最终模型相同)")
 
         # 评估
         print("\n评估模型性能...")

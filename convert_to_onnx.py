@@ -10,8 +10,15 @@ import sys
 import argparse
 import numpy as np
 
+from config import (
+    AppConfig,
+    InferenceConfig,
+    ModelConfig,
+    PathsConfig,
+)
 
-def convert(model_path, output_path, opset=17):
+
+def convert(model_path, output_path, opset=ModelConfig.ONNX_OPSET):
     """将 PyTorch .pth 模型转换为 ONNX 格式"""
     import torch
     from train_model import WiHelperCNN
@@ -29,16 +36,16 @@ def convert(model_path, output_path, opset=17):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"   参数量: {total_params:,}")
 
-    dummy_input = torch.randn(1, 3, 120, 120)
+    dummy_input = torch.randn(*ModelConfig.INPUT_SHAPE)
 
     print(f"🔄 导出 ONNX (opset={opset})...")
     torch.onnx.export(
         model,
         dummy_input,
         output_path,
-        input_names=["image"],
-        output_names=["logit"],
-        dynamic_axes=None,  # 固定 batch=1，优化推理性能
+        input_names=[ModelConfig.INPUT_NAME],
+        output_names=[ModelConfig.OUTPUT_NAME],
+        dynamic_axes=ModelConfig.DYNAMIC_AXES,  # 固定 batch=1，优化推理性能
         opset_version=opset,
     )
 
@@ -48,7 +55,12 @@ def convert(model_path, output_path, opset=17):
     return output_path
 
 
-def verify(model_path, onnx_path, num_samples=100, tolerance=1e-4):
+def verify(
+    model_path,
+    onnx_path,
+    num_samples=InferenceConfig.VERIFY_NUM_SAMPLES,
+    tolerance=InferenceConfig.VERIFY_TOLERANCE,
+):
     """验证 ONNX 模型与 PyTorch 模型输出一致性"""
     import torch
     import onnxruntime as ort
@@ -71,7 +83,7 @@ def verify(model_path, onnx_path, num_samples=100, tolerance=1e-4):
     np.random.seed(42)
     for i in range(num_samples):
         # 生成随机输入
-        img_np = np.random.randint(0, 256, (1, 3, 120, 120)).astype(np.float32) / 255.0
+        img_np = np.random.randint(0, 256, ModelConfig.INPUT_SHAPE).astype(np.float32) / 255.0
 
         # PyTorch 推理
         with torch.no_grad():
@@ -80,7 +92,7 @@ def verify(model_path, onnx_path, num_samples=100, tolerance=1e-4):
             pt_prob = 1.0 / (1.0 + np.exp(-pt_logit))
 
         # ONNX Runtime 推理
-        onnx_logit = session.run(None, {"image": img_np})[0][0, 0]
+        onnx_logit = session.run(None, {ModelConfig.INPUT_NAME: img_np})[0][0, 0]
         onnx_prob = 1.0 / (1.0 + np.exp(-onnx_logit))
 
         diff = abs(pt_prob - onnx_prob)
@@ -99,14 +111,14 @@ def verify(model_path, onnx_path, num_samples=100, tolerance=1e-4):
 
     if pass_count == num_samples:
         print("✅ 验证通过！ONNX 模型与 PyTorch 模型输出完全一致")
-    elif max_diff < 1e-3:
+    elif max_diff < InferenceConfig.VERIFY_ACCEPTABLE_DIFF:
         print("✅ 验证通过！存在微小浮点差异，在实际可接受范围内")
     else:
         print("⚠️ 验证发现显著差异，请检查模型转换")
         sys.exit(1)
 
 
-def benchmark(onnx_path, num_runs=200):
+def benchmark(onnx_path, num_runs=ModelConfig.BENCHMARK_RUNS_ONNX, warmup_runs=ModelConfig.BENCHMARK_WARMUP_ONNX):
     """基准测试 ONNX Runtime 推理速度"""
     import onnxruntime as ort
     import time
@@ -125,15 +137,15 @@ def benchmark(onnx_path, num_runs=200):
         print(f"   提供者: {providers[0]}")
 
     # 预热
-    dummy = np.random.randint(0, 256, (1, 3, 120, 120)).astype(np.float32) / 255.0
-    for _ in range(20):
-        sess.run(None, {"image": dummy})
+    dummy = np.random.randint(0, 256, ModelConfig.INPUT_SHAPE).astype(np.float32) / 255.0
+    for _ in range(warmup_runs):
+        sess.run(None, {ModelConfig.INPUT_NAME: dummy})
 
     # 测速
     times = []
     for _ in range(num_runs):
         start = time.perf_counter()
-        sess.run(None, {"image": dummy})
+        sess.run(None, {ModelConfig.INPUT_NAME: dummy})
         times.append(time.perf_counter() - start)
 
     times_ms = np.array(times) * 1000
@@ -147,12 +159,12 @@ def benchmark(onnx_path, num_runs=200):
 
 def main():
     parser = argparse.ArgumentParser(description="PyTorch → ONNX 模型转换工具")
-    parser.add_argument("--model", default="models/best_model.pth", help="PyTorch 模型路径")
-    parser.add_argument("--output", default="wihelper_model.onnx", help="ONNX 输出路径")
-    parser.add_argument("--opset", type=int, default=17, help="ONNX opset 版本")
+    parser.add_argument("--model", default=InferenceConfig.DEFAULT_PTH_MODEL_PATH, help="PyTorch 模型路径")
+    parser.add_argument("--output", default=AppConfig.DEFAULT_ONNX_MODEL_PATH, help="ONNX 输出路径")
+    parser.add_argument("--opset", type=int, default=ModelConfig.ONNX_OPSET, help="ONNX opset 版本")
     parser.add_argument("--skip-verify", action="store_true", help="跳过一致性验证")
     parser.add_argument("--skip-benchmark", action="store_true", help="跳过速度测试")
-    parser.add_argument("--num-samples", type=int, default=100, help="验证样本数")
+    parser.add_argument("--num-samples", type=int, default=InferenceConfig.VERIFY_NUM_SAMPLES, help="验证样本数")
     args = parser.parse_args()
 
     print("=" * 50)

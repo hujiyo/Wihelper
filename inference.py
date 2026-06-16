@@ -15,15 +15,22 @@ from datetime import datetime
 import cv2
 from train_model import WiHelperCNN
 
+from config import (
+    AppConfig,
+    DataConfig,
+    DeviceConfig,
+    InferenceConfig,
+)
+
 
 class WiHelperDetector:
-    def __init__(self, model_path="models/best_model.pth", threshold=0.5):
+    def __init__(self, model_path=InferenceConfig.DEFAULT_PTH_MODEL_PATH, threshold=InferenceConfig.DEFAULT_TRAIN_THRESHOLD):
         self.model_path = model_path
         self.threshold = threshold
-        self.img_height = 120
-        self.img_width = 120
+        self.img_height = DataConfig.TARGET_SIDE_LENGTH
+        self.img_width = DataConfig.TARGET_SIDE_LENGTH
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = DeviceConfig.get_device(require_cuda=False)
 
         self.load_model()
 
@@ -157,9 +164,8 @@ class WiHelperDetector:
             return (False, 0.0, 0.0) if return_time else (False, 0.0)
 
     def _is_image_file(self, file_path):
-        supported_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'}
         _, ext = os.path.splitext(file_path.lower())
-        return ext in supported_extensions
+        return ext in DataConfig.SUPPORTED_EXT_FULL
 
     def _get_confidence_level(self, probability):
         if probability >= 0.9:
@@ -266,20 +272,18 @@ class WiHelperDetector:
 
     def _infer_true_label_from_filename(self, image_path):
         filename = os.path.basename(image_path).lower()
-        target_keywords = ['target', 'got', 'hit', 'aim']
-        nogot_keywords = ['nogot', 'miss', 'nohit', 'notarget']
 
-        for keyword in target_keywords:
+        for keyword in DataConfig.TARGET_KEYWORDS:
             if keyword in filename:
                 return 1
-        for keyword in nogot_keywords:
+        for keyword in DataConfig.NOGOT_KEYWORDS:
             if keyword in filename:
                 return 0
 
         path_parts = image_path.lower().split(os.sep)
-        if 'got' in path_parts:
+        if DataConfig.GOT_DIR in path_parts:
             return 1
-        elif 'nogot' in path_parts:
+        elif DataConfig.NOGOT_DIR in path_parts:
             return 0
         return 0
 
@@ -347,7 +351,11 @@ class WiHelperDetector:
             print(f"❌ 保存结果文件失败: {e}")
             return None
 
-    def benchmark_inference_speed(self, num_runs=100, warmup_runs=10):
+    def benchmark_inference_speed(
+        self,
+        num_runs=InferenceConfig.BENCHMARK_RUNS,
+        warmup_runs=InferenceConfig.BENCHMARK_WARMUP,
+    ):
         print(f"\n⚡ 测试推理速度...")
         print(f"   预热轮次: {warmup_runs}")
         print(f"   测试轮次: {num_runs}")
@@ -451,10 +459,10 @@ def main():
         """
     )
 
-    parser.add_argument('--model', default='models/best_model.pth',
-                       help='模型文件路径 (默认: models/best_model.pth)')
-    parser.add_argument('--threshold', type=float, default=0.8,
-                       help='预测阈值 (0-1, 默认: 0.8)')
+    parser.add_argument('--model', default=InferenceConfig.DEFAULT_PTH_MODEL_PATH,
+                       help=f'模型文件路径 (默认: {InferenceConfig.DEFAULT_PTH_MODEL_PATH})')
+    parser.add_argument('--threshold', type=float, default=InferenceConfig.DEFAULT_TRAIN_THRESHOLD,
+                       help=f'预测阈值 (0-1, 默认: {InferenceConfig.DEFAULT_TRAIN_THRESHOLD})')
     parser.add_argument('--image', help='单张图片文件路径')
     parser.add_argument('--batch', help='批量预测目录路径')
     parser.add_argument('--benchmark', action='store_true',

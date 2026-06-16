@@ -28,6 +28,14 @@ import gc
 import signal
 from datetime import datetime
 
+from config import (
+    AppConfig,
+    DataConfig,
+    ModelConfig,
+    PathsConfig,
+    ScreenshotConfig,
+)
+
 
 # --- 配置文件 ---
 def get_base_dir():
@@ -38,29 +46,31 @@ def get_base_dir():
 
 
 def load_config():
-    """加载配置文件，不存在则创建默认配置"""
+    """加载配置文件，不存在则创建默认配置；默认值来自 AppConfig。"""
     base_dir = get_base_dir()
-    config_path = os.path.join(base_dir, "config.ini")
+    config_path = os.path.join(base_dir, AppConfig.CONFIG_INI_FILENAME)
 
     config = configparser.ConfigParser()
+    section = AppConfig.CONFIG_INI_SECTION
 
+    # 默认值统一从 AppConfig 读取
     defaults = {
-        'threshold': '0.8',
-        'fire_cooldown': '4.0',
-        'model_path': 'wihelper_model.onnx',
-        'target_fps': '60',
+        'threshold': str(AppConfig.DEFAULT_FIRE_THRESHOLD),
+        'fire_cooldown': str(AppConfig.DEFAULT_FIRE_COOLDOWN),
+        'model_path': AppConfig.DEFAULT_ONNX_MODEL_PATH,
+        'target_fps': str(AppConfig.DEFAULT_TARGET_FPS),
     }
 
     if os.path.exists(config_path):
         config.read(config_path, encoding='utf-8')
-        if 'wihelper' not in config:
-            config['wihelper'] = defaults
+        if section not in config:
+            config[section] = defaults
         else:
             for key, default_val in defaults.items():
-                if key not in config['wihelper']:
-                    config['wihelper'][key] = default_val
+                if key not in config[section]:
+                    config[section][key] = default_val
     else:
-        config['wihelper'] = defaults
+        config[section] = defaults
         try:
             with open(config_path, 'w', encoding='utf-8') as f:
                 config.write(f)
@@ -68,7 +78,7 @@ def load_config():
         except Exception as e:
             print(f"⚠️ 创建配置文件失败: {e}")
 
-    return config['wihelper']
+    return config[section]
 
 
 # 全局变量及锁
@@ -79,13 +89,15 @@ current_result = 0
 
 class OptimizedInferenceModule:
     """ONNX Runtime 推理模块 - 使用 DirectML GPU 加速，CPU 兜底"""
-    def __init__(self, model_path="wihelper_model.onnx", threshold=0.8):
+    def __init__(self, model_path=AppConfig.DEFAULT_ONNX_MODEL_PATH, threshold=AppConfig.DEFAULT_FIRE_THRESHOLD):
         self.model_path = model_path
         self.threshold = threshold
-        self.capture_size = 120
+        self.capture_size = AppConfig.CAPTURE_SIZE
 
         # 预分配推理输入 buffer，避免每帧重新分配
-        self._input_buf = np.zeros((1, 3, 120, 120), dtype=np.float32)
+        self._input_buf = np.zeros(
+            (1, 3, AppConfig.CAPTURE_SIZE, AppConfig.CAPTURE_SIZE), dtype=np.float32
+        )
         self._inv_255 = np.float32(1.0 / 255.0)
         self._is_gpu = False
         self._load_model()
@@ -150,9 +162,15 @@ class OptimizedInferenceModule:
         """预热模型"""
         print("🔥 预热模型...")
         try:
-            dummy_bgra = np.random.randint(0, 255, (120, 120, 4), dtype=np.uint8).tobytes()
-            for _ in range(5):
-                _ = self.predict_from_raw_bgra(dummy_bgra, 120, 120)
+            dummy_bgra = np.random.randint(
+                0, 255,
+                (AppConfig.CAPTURE_SIZE, AppConfig.CAPTURE_SIZE, AppConfig.WARMUP_DUMMY_CHANNELS),
+                dtype=np.uint8,
+            ).tobytes()
+            for _ in range(AppConfig.WARMUP_RUNS):
+                _ = self.predict_from_raw_bgra(
+                    dummy_bgra, AppConfig.CAPTURE_SIZE, AppConfig.CAPTURE_SIZE
+                )
         except Exception as e:
             print(f"⚠️ 预热出错: {e}")
         print("✓ 模型预热完成")
@@ -169,7 +187,7 @@ class OptimizedInferenceModule:
             # in-place 归一化
             buf *= self._inv_255
             # 推理
-            logit = self.session.run(None, {"image": self._input_buf})[0]
+            logit = self.session.run(None, {ModelConfig.INPUT_NAME: self._input_buf})[0]
             return float(1.0 / (1.0 + np.exp(-logit[0, 0])))
         except Exception as e:
             print(f"❌ 推理失败: {e}")
@@ -184,7 +202,7 @@ class OptimizedInferenceModule:
             buf[0] = img[:, :, 0]  # R
             buf[1] = img[:, :, 1]  # G
             buf[2] = img[:, :, 2]  # B
-            logit = self.session.run(None, {"image": self._input_buf})[0]
+            logit = self.session.run(None, {ModelConfig.INPUT_NAME: self._input_buf})[0]
             return float(1.0 / (1.0 + np.exp(-logit[0, 0])))
         except Exception as e:
             print(f"❌ 推理失败: {e}")
@@ -192,10 +210,12 @@ class OptimizedInferenceModule:
 
 class ScreenshotInferenceThread(threading.Thread):
     """截图推理线程"""
-    def __init__(self, inference_module, target_fps=60):
+    def __init__(self, inference_module, target_fps=AppConfig.DEFAULT_TARGET_FPS):
         super().__init__()
         self.inference_module = inference_module
-        self.target_fps = max(1, min(target_fps, 240))  # 限制在 1~240 FPS
+        self.target_fps = max(
+            AppConfig.MIN_FPS, min(target_fps, AppConfig.MAX_FPS)
+        )  # 限制在 MIN_FPS~MAX_FPS
         self.running = True
         self.screenshot_lock = threading.Lock()
         self.current_screenshot = None
@@ -205,7 +225,7 @@ class ScreenshotInferenceThread(threading.Thread):
 
         self._frame_count = 0
         self._last_fps_time = time.time()
-        self._fps_interval = 5.0
+        self._fps_interval = AppConfig.FPS_STAT_INTERVAL
 
     def _precompute_capture_region(self):
         size = self.inference_module.capture_size
@@ -452,7 +472,7 @@ class RawInputMouseListener:
     def stop(self):
         self.running = False
         if self.thread.is_alive():
-            self.thread.join(timeout=1.0)
+            self.thread.join(timeout=AppConfig.MOUSE_LISTENER_JOIN_TIMEOUT)
         try:
             if self.hwnd:
                 win32gui.DestroyWindow(self.hwnd)
@@ -466,7 +486,7 @@ class RawInputMouseListener:
 
 class FeedbackCollector:
     """反馈数据收集器"""
-    def __init__(self, save_dir="image"):
+    def __init__(self, save_dir=DataConfig.DATA_DIR):
         self.save_dir = save_dir
         self.feedback_count = 0
 
@@ -492,7 +512,13 @@ class FeedbackCollector:
 
 class WiHelper:
     """激光射蚊子助手主类"""
-    def __init__(self, fire_cooldown=4.0, model_path="wihelper_model.onnx", threshold=0.8, target_fps=60):
+    def __init__(
+        self,
+        fire_cooldown=AppConfig.DEFAULT_FIRE_COOLDOWN,
+        model_path=AppConfig.DEFAULT_ONNX_MODEL_PATH,
+        threshold=AppConfig.DEFAULT_FIRE_THRESHOLD,
+        target_fps=AppConfig.DEFAULT_TARGET_FPS,
+    ):
         self.judging_mode = False
         self.judging_start_time = 0
         self.right_mouse_pressed = False
@@ -516,7 +542,7 @@ class WiHelper:
         self.feedback_collector = FeedbackCollector()
 
         try:
-            ctypes.windll.kernel32.SetConsoleTitleW("Windows Service Host")
+            ctypes.windll.kernel32.SetConsoleTitleW(AppConfig.CONSOLE_TITLE)
             print("✓ 进程名称伪装完成")
         except Exception as e:
             print(f"✗ 进程名称伪装失败: {e}")
@@ -525,7 +551,7 @@ class WiHelper:
 
     def on_key_press(self, key):
         try:
-            if hasattr(key, 'char') and key.char == 'f':
+            if hasattr(key, 'char') and key.char == AppConfig.INTERRUPT_KEY_CHAR:
                 if self.judging_mode:
                     print("⌨️ F键按下：打断判断模式")
                     self.f_key_pressed = True
@@ -572,12 +598,12 @@ class WiHelper:
         initial_left_pressed = self.left_mouse_pressed
         initial_right_pressed = self.right_mouse_pressed
 
-        aiming_time = 0.5
-        total_timeout = 4.0
+        aiming_time = AppConfig.AIMING_TIME
+        total_timeout = AppConfig.TOTAL_TIMEOUT
         start_time = time.time()
 
         fire_count = 0
-        max_fire_count = 8
+        max_fire_count = AppConfig.MAX_FIRE_COUNT
         last_fire_time = 0
         fire_cooldown = self.fire_cooldown
 
@@ -597,7 +623,7 @@ class WiHelper:
                 current_time = time.time()
                 if not hasattr(self, '_last_debug_time'):
                     self._last_debug_time = 0
-                if current_time - self._last_debug_time > 0.1:
+                if current_time - self._last_debug_time > AppConfig.DEBUG_INTERVAL:
                     with global_lock:
                         current_if_exit_goal = if_exit_goal
                         current_current_result = current_result
@@ -631,7 +657,7 @@ class WiHelper:
                         self.fire_laser()
                         last_fire_time = current_time
 
-                        is_sniper_mode = self.fire_cooldown >= 4.0
+                        is_sniper_mode = self.fire_cooldown >= AppConfig.SNIPER_COOLDOWN_THRESHOLD
                         if fire_count >= max_fire_count or is_sniper_mode:
                             reason = f"达到最大开火次数({max_fire_count}枪)" if not is_sniper_mode else "大狙模式单发命中"
                             print(f"✅ {reason}，退出瞄准模式")
@@ -657,7 +683,7 @@ class WiHelper:
     def fire_laser(self):
         keyboard = None
         try:
-            if self.fire_cooldown >= 4.0:
+            if self.fire_cooldown >= AppConfig.SNIPER_COOLDOWN_THRESHOLD:
                 current_screenshot = self.screenshot_thread.get_current_screenshot()
                 if current_screenshot is not None:
                     current_probability = self.inference_module.predict_from_pil_image(current_screenshot)
@@ -667,8 +693,8 @@ class WiHelper:
                     print("⚠️ 无法获取当前截图，跳过反馈数据收集")
 
             keyboard = KeyboardController()
-            keyboard.press('p')
-            keyboard.release('p')
+            keyboard.press(AppConfig.FIRE_KEY)
+            keyboard.release(AppConfig.FIRE_KEY)
             print("💥 激光发射成功！")
 
         except Exception as e:
@@ -679,27 +705,27 @@ class WiHelper:
 
     def play_fire_sound(self):
         try:
-            winsound.MessageBeep(0x40)
+            winsound.MessageBeep(AppConfig.SOUND_SUCCESS)
         except Exception as e:
             print(f"❌ 音频播放失败: {e}")
 
     def run(self):
         print("🚀 WiHelper激光射蚊子助手启动")
         print(f"⏱️  当前开枪延迟设置: {self.fire_cooldown}秒")
-        if self.fire_cooldown >= 4.0:
-            print("📍 模式: 大狙模式（单发精确射击，4秒延迟相当于一枪后自动退出）")
+        if self.fire_cooldown >= AppConfig.SNIPER_COOLDOWN_THRESHOLD:
+            print(f"📍 模式: 大狙模式（单发精确射击，{AppConfig.SNIPER_COOLDOWN_THRESHOLD}秒延迟相当于一枪后自动退出）")
             print("💾 反馈数据: 每次开火时会自动保存截图到image文件夹")
         else:
-            print(f"📍 模式: 连狙模式（{self.fire_cooldown}秒延迟，4秒内最多8枪）")
+            print(f"📍 模式: 连狙模式（{self.fire_cooldown}秒延迟，{AppConfig.TOTAL_TIMEOUT}秒内最多{AppConfig.MAX_FIRE_COUNT}枪）")
             print("💾 反馈数据: 连狙模式不保存截图")
         print("🖱️  右键点击进入判断模式")
-        print("⌨️  按F键可打断判断模式（左键不会打断）")
+        print(f"⌨️  按{AppConfig.INTERRUPT_KEY.upper()}键可打断判断模式（左键不会打断）")
         print("⌨️  按Ctrl+C退出程序")
 
         try:
             while True:
                 self._memory_check_counter += 1
-                if self._memory_check_counter >= 1000:
+                if self._memory_check_counter >= AppConfig.MEMORY_CHECK_INTERVAL:
                     gc.collect()
                     self._memory_check_counter = 0
                 time.sleep(1)
@@ -715,11 +741,11 @@ class WiHelper:
         print("正在清理资源...")
 
         if self.judging_thread and self.judging_thread.is_alive():
-            self.judging_thread.join(timeout=1.0)
+            self.judging_thread.join(timeout=AppConfig.THREAD_JOIN_TIMEOUT)
 
         if self.screenshot_thread:
             self.screenshot_thread.stop()
-            self.screenshot_thread.join(timeout=1.0)
+            self.screenshot_thread.join(timeout=AppConfig.THREAD_JOIN_TIMEOUT)
 
         if self.mouse_listener:
             self.mouse_listener.stop()

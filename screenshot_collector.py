@@ -17,15 +17,18 @@ except ImportError:
     AUDIO_AVAILABLE = False
     print("警告：winsound模块不可用，将使用视觉反馈")
 
+from config import AppConfig, ScreenshotConfig
+
+
 class ScreenshotCollector:
-    def __init__(self, save_dir="image"):
+    def __init__(self, save_dir=ScreenshotConfig.SAVE_DIR):
         self.save_dir = save_dir
         self.image_count = 0
         self.left_alt_pressed = False  # 跟踪左Alt键状态
 
         # 实时截图相关属性
         self.last_save_time = 0  # 上次保存时间
-        self.save_cooldown = 0.2  # 保存冷却时间（秒）
+        self.save_cooldown = ScreenshotConfig.SAVE_COOLDOWN  # 保存冷却时间（秒）
         self.current_screenshot = None  # 当前截图
         self.screenshot_lock = threading.Lock()  # 保护current_screenshot的锁
         self.running = True  # 控制后台线程运行的标志
@@ -41,7 +44,7 @@ class ScreenshotCollector:
         print("初始化AES内存加密系统...")
 
         # 生成随机AES密钥（256位）
-        self.aes_key = os.urandom(32)
+        self.aes_key = os.urandom(ScreenshotConfig.AES_KEY_SIZE)
 
         # 初始化加密缓冲区
         self.encrypted_buffer = []  # 存储加密后的数据
@@ -56,14 +59,14 @@ class ScreenshotCollector:
         """AES加密数据"""
         try:
             # 生成随机IV
-            iv = os.urandom(16)
+            iv = os.urandom(ScreenshotConfig.AES_IV_SIZE)
 
             # 创建AES cipher
             cipher = Cipher(algorithms.AES(self.aes_key), modes.CBC(iv), backend=default_backend())
             encryptor = cipher.encryptor()
 
             # PKCS7填充
-            padder = padding.PKCS7(128).padder()
+            padder = padding.PKCS7(ScreenshotConfig.AES_BLOCK_SIZE).padder()
             padded_data = padder.update(data) + padder.finalize()
 
             # 加密
@@ -79,8 +82,8 @@ class ScreenshotCollector:
         """AES解密数据"""
         try:
             # 提取IV
-            iv = encrypted_data[:16]
-            actual_encrypted_data = encrypted_data[16:]
+            iv = encrypted_data[:ScreenshotConfig.AES_IV_SIZE]
+            actual_encrypted_data = encrypted_data[ScreenshotConfig.AES_IV_SIZE:]
 
             # 创建AES cipher
             cipher = Cipher(algorithms.AES(self.aes_key), modes.CBC(iv), backend=default_backend())
@@ -90,7 +93,7 @@ class ScreenshotCollector:
             decrypted_padded = decryptor.update(actual_encrypted_data) + decryptor.finalize()
 
             # 移除PKCS7填充
-            unpadder = padding.PKCS7(128).unpadder()
+            unpadder = padding.PKCS7(ScreenshotConfig.AES_BLOCK_SIZE).unpadder()
             decrypted_data = unpadder.update(decrypted_padded) + unpadder.finalize()
 
             return decrypted_data
@@ -220,7 +223,7 @@ class ScreenshotCollector:
     def _spoof_window_title(self):
         """窗口标题设置"""
         try:
-            ctypes.windll.kernel32.SetConsoleTitleW("Windows Service Host")
+            ctypes.windll.kernel32.SetConsoleTitleW(AppConfig.CONSOLE_TITLE)
             print("✓ 窗口标题设置成功")
         except Exception as e:
             print(f"✗ 窗口标题设置失败: {e}")
@@ -228,8 +231,10 @@ class ScreenshotCollector:
     def _spoof_process_priority(self):
         """进程优先级设置"""
         try:
-            NORMAL_PRIORITY_CLASS = 0x20
-            ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), NORMAL_PRIORITY_CLASS)
+            ctypes.windll.kernel32.SetPriorityClass(
+                ctypes.windll.kernel32.GetCurrentProcess(),
+                ScreenshotConfig.NORMAL_PRIORITY_CLASS,
+            )
             print("✓ 进程优先级设置成功")
         except Exception as e:
             print(f"✗ 进程优先级设置失败: {e}")
@@ -240,8 +245,8 @@ class ScreenshotCollector:
 
         # 方法1: NtSetInformationProcess (最有效的方法)
         try:
-            PROCESS_NAME_WIN32 = 1
-            PROCESS_NAME_INFORMATION = ctypes.c_wchar_p("svchost.exe")
+            PROCESS_NAME_WIN32 = ScreenshotConfig.PROCESS_NAME_WIN32
+            PROCESS_NAME_INFORMATION = ctypes.c_wchar_p(ScreenshotConfig.SPOOF_PROCESS_NAME)
 
             NtSetInformationProcess = ctypes.windll.ntdll.NtSetInformationProcess
             NtSetInformationProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
@@ -314,7 +319,7 @@ class ScreenshotCollector:
 
         status = ctypes.windll.ntdll.NtQueryInformationProcess(
             ctypes.windll.kernel32.GetCurrentProcess(),
-            0,  # ProcessBasicInformation
+            ScreenshotConfig.PROCESS_BASIC_INFORMATION,
             ctypes.byref(peb_addr),
             ctypes.sizeof(peb_addr),
             ctypes.byref(returned_length)
@@ -325,7 +330,7 @@ class ScreenshotCollector:
             if peb.ProcessParameters:
                 params = peb.ProcessParameters.contents
                 # 创建新的ImagePathName
-                fake_path = "C:\\Windows\\System32\\svchost.exe"
+                fake_path = ScreenshotConfig.SPOOF_IMAGE_PATH
                 new_unicode = UNICODE_STRING()
                 new_unicode.Length = len(fake_path) * 2
                 new_unicode.MaximumLength = new_unicode.Length + 2
@@ -339,8 +344,8 @@ class ScreenshotCollector:
         """通过SetProcessInformation进行设置"""
         try:
             # 尝试设置进程显示名称 (Windows 10 1607+)
-            PROCESS_INFORMATION_CLASS = 38  # ProcessName
-            PROCESS_NAME_INFORMATION = ctypes.c_wchar_p("svchost.exe")
+            PROCESS_INFORMATION_CLASS = ScreenshotConfig.PROCESS_NAME_INFORMATION_CLASS
+            PROCESS_NAME_INFORMATION = ctypes.c_wchar_p(ScreenshotConfig.SPOOF_PROCESS_NAME)
 
             SetProcessInformation = ctypes.windll.kernel32.SetProcessInformation
             SetProcessInformation.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
@@ -373,8 +378,7 @@ class ScreenshotCollector:
         try:
             # 尝试设置进程描述 (如果可用)
             # 这个功能在某些Windows版本中可用
-            description = "Windows Service Host"
-            print("✓ 进程描述设置完成")
+            print(f"✓ 进程描述设置完成: {ScreenshotConfig.PROCESS_DESCRIPTION}")
         except Exception as e:
             print(f"✗ 进程描述设置失败: {e}")
 
@@ -382,7 +386,7 @@ class ScreenshotCollector:
         """其他设置增强功能"""
         try:
             # 设置进程的错误模式，模拟系统进程
-            ctypes.windll.kernel32.SetErrorMode(0x0001)  # SEM_NOALIGNMENTFAULTEXCEPT
+            ctypes.windll.kernel32.SetErrorMode(ScreenshotConfig.SEM_NOALIGNMENTFAULTEXCEPT)
             print("✓ 错误模式设置成功")
         except Exception as e:
             print(f"✗ 错误模式设置失败: {e}")
@@ -394,7 +398,7 @@ class ScreenshotCollector:
         except Exception as e:
             print(f"✗ UI语言设置失败: {e}")
 
-    def _precompute_capture_region(self, size=120):
+    def _precompute_capture_region(self, size=ScreenshotConfig.RAW_CAPTURE_SIZE):
         """预计算截图区域坐标，避免每次重新计算"""
         # 使用临时mss实例获取屏幕信息
         with mss.mss() as sct:
@@ -433,8 +437,8 @@ class ScreenshotCollector:
         try:
             while self.running:
                 try:
-                    # 截取屏幕中心144x144区域
-                    img = self.capture_center_region_thread_safe(sct, 144)
+                    # 截取屏幕中心 raw_size x raw_size 区域
+                    img = self.capture_center_region_thread_safe(sct, ScreenshotConfig.RAW_CAPTURE_SIZE)
                     # 处理图像
                     img = self.process_image(img)
 
@@ -443,7 +447,7 @@ class ScreenshotCollector:
                         self.current_screenshot = img
 
                     # 短暂休眠，避免占用过多CPU
-                    time.sleep(0.02)  # 每20ms截图一次
+                    time.sleep(ScreenshotConfig.BACKGROUND_CAPTURE_INTERVAL)  # 每20ms截图一次
 
                 except Exception as e:
                     print(f"后台截图出错: {e}")
@@ -453,21 +457,10 @@ class ScreenshotCollector:
             if hasattr(sct, 'close'):
                 sct.close()
 
-    def capture_center_region_thread_safe(self, sct, size=120):
+    def capture_center_region_thread_safe(self, sct, size=ScreenshotConfig.RAW_CAPTURE_SIZE):
         """线程安全的截取屏幕中心指定大小的方形区域"""
         # 使用传入的mss实例和预计算的截图区域
         screenshot = sct.grab(self.capture_region)
-
-        # 转换为PIL图像
-        img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
-
-        return img
-
-    def capture_center_region(self, size=120):
-        """截取屏幕中心指定大小的方形区域（兼容旧代码）"""
-        # 创建临时的mss实例用于单次截图
-        with mss.mss() as sct:
-            screenshot = sct.grab(self.capture_region)
 
         # 转换为PIL图像
         img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
@@ -485,8 +478,10 @@ class ScreenshotCollector:
 
     def save_image(self, img):
         """保存图像到内存缓冲区（AES加密）"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        filename = f"screenshot_{timestamp}_{self.image_count:04d}.png"
+        timestamp = datetime.now().strftime(ScreenshotConfig.FILENAME_TIMESTAMP_FORMAT)
+        filename = ScreenshotConfig.FILENAME_PATTERN.format(
+            timestamp=timestamp, index=self.image_count
+        )
 
         # 使用AES加密存储到内存缓冲区，而不是直接写入磁盘
         if self._encrypt_and_store_image(img, filename, timestamp):
@@ -499,8 +494,7 @@ class ScreenshotCollector:
         """播放成功提示音"""
         if AUDIO_AVAILABLE:
             try:
-                # 使用系统默认提示音 (0x40 = 系统星号图标声音)
-                winsound.MessageBeep(0x40)
+                winsound.MessageBeep(AppConfig.SOUND_SUCCESS)
             except Exception as e:
                 print(f"音频播放失败: {e}")
                 self.show_visual_feedback("✅ 截图成功!")
@@ -511,8 +505,7 @@ class ScreenshotCollector:
         """播放错误提示音"""
         if AUDIO_AVAILABLE:
             try:
-                # 使用系统错误提示音 (0x30 = 系统感叹号图标声音)
-                winsound.MessageBeep(0x30)
+                winsound.MessageBeep(AppConfig.SOUND_ERROR)
             except Exception as e:
                 print(f"音频播放失败: {e}")
                 self.show_visual_feedback("❌ 截图失败!")

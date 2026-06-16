@@ -21,14 +21,22 @@ import numpy as np
 import torch
 from train_model import WiHelperCNN, preprocess, find_best_model
 
+from config import (
+    DataConfig,
+    DeviceConfig,
+    InferenceConfig,
+    PathsConfig,
+    UIConfig,
+)
+
 
 class SelectHelper:
-    def __init__(self, source_dir="image", target_base="image"):
+    def __init__(self, source_dir=UIConfig.SOURCE_DIR, target_base=UIConfig.TARGET_BASE):
         self.source_dir = source_dir
         self.target_base = target_base
 
-        self.train_target_dir = os.path.join(target_base, "train", "got")
-        self.train_notarget_dir = os.path.join(target_base, "train", "nogot")
+        self.train_target_dir = os.path.join(target_base, DataConfig.TRAIN_DIR, DataConfig.GOT_DIR)
+        self.train_notarget_dir = os.path.join(target_base, DataConfig.TRAIN_DIR, DataConfig.NOGOT_DIR)
 
         for dir_path in [self.train_target_dir, self.train_notarget_dir]:
             if os.path.exists(dir_path):
@@ -50,7 +58,7 @@ class SelectHelper:
         }
 
         self.undo_stack = []
-        self.max_undo = 5
+        self.max_undo = UIConfig.MAX_UNDO
 
         self.root = None
         self.image_label = None
@@ -70,7 +78,7 @@ class SelectHelper:
             print("  未找到模型文件，跳过模型预测")
             return
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = DeviceConfig.get_device(require_cuda=False)
         self.model = WiHelperCNN()
         state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(state_dict)
@@ -86,7 +94,7 @@ class SelectHelper:
             with torch.no_grad():
                 logit = self.model(tensor.to(self.device))
                 prob = torch.sigmoid(logit).item()
-            pred_label = 1 if prob >= 0.5 else 0
+            pred_label = 1 if prob >= InferenceConfig.DEFAULT_TRAIN_THRESHOLD else 0
             self.predictions[fpath] = (prob, pred_label)
 
             if (i + 1) % 50 == 0 or i + 1 == len(image_files):
@@ -102,7 +110,7 @@ class SelectHelper:
         all_files = []
         try:
             for file in os.listdir(self.source_dir):
-                if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+                if file.lower().endswith(DataConfig.SUPPORTED_EXT):
                     full_path = os.path.join(self.source_dir, file)
                     if os.path.isfile(full_path):
                         all_files.append(full_path)
@@ -117,10 +125,10 @@ class SelectHelper:
     def setup_gui(self):
         self.root = tk.Tk()
         self.root.title("数据标注助手")
-        self.root.geometry("520x700")
+        self.root.geometry(UIConfig.WINDOW_SIZE)
         self.root.resizable(True, True)
 
-        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame = ttk.Frame(self.root, padding=UIConfig.WINDOW_PADDING)
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
         self.root.columnconfigure(0, weight=1)
@@ -134,8 +142,8 @@ class SelectHelper:
 
         # 模型预测显示区域 - 显眼的大字
         self.prediction_label = tk.Label(
-            main_frame, text="", font=("Arial", 18, "bold"),
-            fg="white", bg="gray", pady=8
+            main_frame, text="", font=UIConfig.PRED_FONT,
+            fg=UIConfig.PRED_TEXT_COLOR, bg=UIConfig.PRED_BG_DEFAULT, pady=8
         )
         self.prediction_label.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
 
@@ -168,42 +176,48 @@ class SelectHelper:
     def update_prediction_display(self):
         """更新模型预测显示"""
         if self.current_index >= len(self.image_files):
-            self.prediction_label.config(text="", bg="gray")
+            self.prediction_label.config(text="", bg=UIConfig.PRED_BG_DEFAULT)
             return
 
         current_file = self.image_files[self.current_index]
         if current_file not in self.predictions:
-            self.prediction_label.config(text="无模型预测", bg="gray", fg="white")
+            self.prediction_label.config(
+                text="无模型预测",
+                bg=UIConfig.PRED_BG_DEFAULT,
+                fg=UIConfig.PRED_TEXT_COLOR,
+            )
             return
 
         prob, pred_label = self.predictions[current_file]
 
         if pred_label == 1:
             # 模型认为有目标
-            if prob >= 0.8:
-                bg_color = "#CC0000"  # 深红 - 高置信度有目标
+            if prob >= UIConfig.PRED_BG_HIGH_GOT_THRESHOLD:
+                bg_color = UIConfig.PRED_COLORS["got_high"]   # 深红 - 高置信度有目标
                 text = f"模型建议: 中了  ({prob:.1%})"
-            elif prob >= 0.6:
-                bg_color = "#DD6644"  # 橙红 - 中等置信度
+            elif prob >= UIConfig.PRED_BG_MEDIUM_GOT_THRESHOLD:
+                bg_color = UIConfig.PRED_COLORS["got_medium"]  # 橙红 - 中等置信度
                 text = f"模型建议: 可能中了  ({prob:.1%})"
             else:
-                bg_color = "#DDAA44"  # 橙黄 - 低置信度
+                bg_color = UIConfig.PRED_COLORS["got_low"]   # 橙黄 - 低置信度
                 text = f"模型建议: 倾向中了  ({prob:.1%})"
-            fg_color = "white"
         else:
             # 模型认为无目标
-            if prob <= 0.2:
-                bg_color = "#0066CC"  # 深蓝 - 高置信度无目标
+            if prob <= UIConfig.PRED_BG_HIGH_NOGOT_THRESHOLD:
+                bg_color = UIConfig.PRED_COLORS["nogot_high"]    # 深蓝 - 高置信度无目标
                 text = f"模型建议: 没中  ({prob:.1%})"
-            elif prob <= 0.4:
-                bg_color = "#4488CC"  # 浅蓝 - 中等置信度
+            elif prob <= UIConfig.PRED_BG_MEDIUM_NOGOT_THRESHOLD:
+                bg_color = UIConfig.PRED_COLORS["nogot_medium"]  # 浅蓝 - 中等置信度
                 text = f"模型建议: 可能没中  ({prob:.1%})"
             else:
-                bg_color = "#88AACC"  # 更浅蓝 - 低置信度
+                bg_color = UIConfig.PRED_COLORS["nogot_low"]     # 更浅蓝 - 低置信度
                 text = f"模型建议: 倾向没中  ({prob:.1%})"
-            fg_color = "white"
 
-        self.prediction_label.config(text=text, bg=bg_color, fg=fg_color)
+        self.prediction_label.config(
+            text=text,
+            bg=bg_color,
+            fg=UIConfig.PRED_TEXT_COLOR,
+        )
 
     def update_info(self):
         if self.info_label:
@@ -221,9 +235,8 @@ class SelectHelper:
                 window_width = self.root.winfo_width()
                 window_height = self.root.winfo_height()
 
-                if window_width < 100 or window_height < 200:
-                    window_width = 520
-                    window_height = 700
+                if window_width < UIConfig.WINDOW_MIN_WIDTH or window_height < UIConfig.WINDOW_MIN_HEIGHT:
+                    window_width, window_height = (int(x) for x in UIConfig.WINDOW_SIZE.split("x"))
 
                 scale = min((window_width - 50) / img_width,
                            (window_height - 280) / img_height,
@@ -297,7 +310,7 @@ class SelectHelper:
         current_file = self.image_files[self.current_index]
         filename = os.path.basename(current_file)
 
-        recycle_dir = os.path.join(self.target_base, ".recycle")
+        recycle_dir = os.path.join(self.target_base, UIConfig.RECYCLE_DIR)
         if not os.path.exists(recycle_dir):
             os.makedirs(recycle_dir, exist_ok=True)
 
@@ -409,7 +422,7 @@ class SelectHelper:
             except Exception as e:
                 print(f"  显示第一张图片失败: {e}")
 
-        self.root.after(300, show_first_image)
+        self.root.after(UIConfig.SHOW_FIRST_IMAGE_DELAY_MS, show_first_image)
         self.root.mainloop()
 
 
