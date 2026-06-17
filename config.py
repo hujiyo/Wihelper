@@ -249,24 +249,6 @@ class ScreenshotConfig:
     # 屏幕中心截图区域
     RAW_CAPTURE_SIZE = 144       # 后台持续截取的方形边长（大图人工分类更清晰，小图用于训练）
 
-    # AES-256-CBC 内存加密
-    AES_KEY_SIZE = 32
-    AES_IV_SIZE = 16
-    AES_BLOCK_SIZE = 128
-
-    # 进程名/窗口标题伪装
-    # 控制台标题统一用 AppConfig.CONSOLE_TITLE（避免多类同名）
-    PROCESS_DESCRIPTION = "Windows Service Host"
-    SPOOF_PROCESS_NAME = "svchost.exe"
-    SPOOF_IMAGE_PATH = "C:\\Windows\\System32\\svchost.exe"
-    NORMAL_PRIORITY_CLASS = 0x20
-    SEM_NOALIGNMENTFAULTEXCEPT = 0x0001
-
-    # 进程信息类（Windows API）
-    PROCESS_NAME_WIN32 = 1
-    PROCESS_BASIC_INFORMATION = 0
-    PROCESS_NAME_INFORMATION_CLASS = 38  # ProcessName（Windows 10 1607+）
-
     # 截图文件名
     FILENAME_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S_%f"
     FILENAME_PATTERN = "screenshot_{timestamp}_{index:04d}.png"

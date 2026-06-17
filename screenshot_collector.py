@@ -1,15 +1,15 @@
 import os
 import time
 import threading
+import uuid
 from datetime import datetime
 from PIL import Image
 import mss
 import keyboard as kb
 from pynput import mouse, keyboard as pynput_kb
 import ctypes
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import padding
-from cryptography.hazmat.backends import default_backend
+import ctypes.wintypes as wintypes
+import win32gui
 try:
     import winsound
     AUDIO_AVAILABLE = True
@@ -18,6 +18,161 @@ except ImportError:
     print("警告：winsound模块不可用，将使用视觉反馈")
 
 from config import AppConfig, ScreenshotConfig
+
+
+# --- Windows API 结构体定义 ---
+user32 = ctypes.windll.user32
+
+RIDEV_INPUTSINK = 0x00000100
+RIDEV_NOLEGACY = 0x00000030
+RID_INPUT = 0x10000003
+RIM_TYPEMOUSE = 0
+
+WM_INPUT = 0x00FF
+
+class RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [
+        ("usUsagePage", wintypes.USHORT),
+        ("usUsage", wintypes.USHORT),
+        ("dwFlags", wintypes.DWORD),
+        ("hwndTarget", wintypes.HWND),
+    ]
+
+class RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [
+        ("dwType", wintypes.DWORD),
+        ("dwSize", wintypes.DWORD),
+        ("hDevice", wintypes.HANDLE),
+        ("wParam", wintypes.WPARAM),
+    ]
+
+class RAWMOUSE(ctypes.Structure):
+    _fields_ = [
+        ("usFlags", wintypes.USHORT),
+        ("ulButtons", wintypes.ULONG),
+        ("usButtonFlags", wintypes.USHORT),
+        ("usButtonData", wintypes.USHORT),
+        ("ulRawButtons", wintypes.ULONG),
+        ("lLastX", wintypes.LONG),
+        ("lLastY", wintypes.LONG),
+        ("ulExtraInformation", wintypes.ULONG),
+    ]
+
+class RAWINPUTUNION(ctypes.Union):
+    _fields_ = [
+        ("mouse", RAWMOUSE),
+    ]
+
+class RAWINPUT(ctypes.Structure):
+    _fields_ = [
+        ("header", RAWINPUTHEADER),
+        ("data", RAWINPUTUNION),
+    ]
+
+
+class RawInputMouseListener:
+    """基于 Raw Input API 的鼠标监听器（不安装低级钩子，降低被反作弊检测的风险）"""
+    def __init__(self, on_click_callback):
+        self.on_click_callback = on_click_callback
+        self.running = True
+        self.thread = threading.Thread(target=self._message_loop, daemon=True)
+        self.hwnd = None
+        self.class_atom = None
+        self.thread.start()
+
+    def _message_loop(self):
+        try:
+            wc = win32gui.WNDCLASS()
+            wc.lpfnWndProc = self._wnd_proc
+            wc.lpszClassName = f"RawInputListener_{uuid.uuid4()}"
+            hinst = wc.hInstance = win32gui.GetModuleHandle(None)
+            class_atom = win32gui.RegisterClass(wc)
+            hwnd = win32gui.CreateWindow(class_atom, "RawInputHidden", 0, 0, 0, 0, 0, 0, 0, hinst, None)
+
+            if not hwnd:
+                raise RuntimeError("窗口创建失败")
+
+            self.hwnd = hwnd
+            self.class_atom = class_atom
+
+            rid = RAWINPUTDEVICE()
+            rid.usUsagePage = 0x01
+            rid.usUsage = 0x02
+            rid.dwFlags = RIDEV_INPUTSINK
+            rid.hwndTarget = hwnd
+
+            if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(rid)):
+                rid.hwndTarget = None
+                if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(rid)):
+                    rid.dwFlags = RIDEV_INPUTSINK | RIDEV_NOLEGACY
+                    rid.hwndTarget = hwnd
+                    if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(rid)):
+                        rid.dwFlags = RIDEV_NOLEGACY
+                        if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(rid)):
+                            raise RuntimeError("所有Raw Input注册模式都失败")
+
+            while self.running:
+                win32gui.PumpWaitingMessages()
+                time.sleep(0.005)
+
+        except Exception as e:
+            print(f"Raw Input 鼠标监听器初始化失败: {e}")
+            raise
+        finally:
+            try:
+                if self.hwnd:
+                    win32gui.DestroyWindow(self.hwnd)
+                    self.hwnd = None
+            except Exception as e:
+                print(f"清理窗口资源时出错: {e}")
+
+    def _wnd_proc(self, hwnd, msg, wparam, lparam):
+        if msg == WM_INPUT:
+            self._handle_raw_input(lparam)
+        return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+    def _handle_raw_input(self, lparam):
+        buf = None
+        try:
+            size = wintypes.UINT()
+            user32.GetRawInputData(lparam, RID_INPUT, None, ctypes.byref(size), ctypes.sizeof(RAWINPUTHEADER))
+
+            if size.value == 0:
+                return
+
+            buf = ctypes.create_string_buffer(size.value)
+            result = user32.GetRawInputData(lparam, RID_INPUT, buf, ctypes.byref(size), ctypes.sizeof(RAWINPUTHEADER))
+
+            if result == -1:
+                return
+
+            button_flags = int.from_bytes(buf.raw[28:32], byteorder='little', signed=False)
+
+            if button_flags != 0:
+                if button_flags == 0x01:
+                    self.on_click_callback('left', True)
+                elif button_flags == 0x04:
+                    self.on_click_callback('right', True)
+
+        except Exception as e:
+            print(f"处理Raw Input数据失败: {e}")
+        finally:
+            if buf is not None:
+                del buf
+
+    def stop(self):
+        self.running = False
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+        try:
+            if self.hwnd:
+                win32gui.DestroyWindow(self.hwnd)
+                self.hwnd = None
+            if self.class_atom:
+                win32gui.UnregisterClass(self.class_atom, None)
+                self.class_atom = None
+        except Exception as e:
+            print(f"清理Raw Input资源时出错: {e}")
 
 
 class ScreenshotCollector:
@@ -32,371 +187,6 @@ class ScreenshotCollector:
         self.current_screenshot = None  # 当前截图
         self.screenshot_lock = threading.Lock()  # 保护current_screenshot的锁
         self.running = True  # 控制后台线程运行的标志
-
-        # AES加密内存存储系统
-        self._initialize_encryption_system()
-
-        # 全面过程设置系统
-        self._initialize_comprehensive_spoofing()
-
-    def _initialize_encryption_system(self):
-        """初始化AES加密内存存储系统"""
-        print("初始化AES内存加密系统...")
-
-        # 生成随机AES密钥（256位）
-        self.aes_key = os.urandom(ScreenshotConfig.AES_KEY_SIZE)
-
-        # 初始化加密缓冲区
-        self.encrypted_buffer = []  # 存储加密后的数据
-        self.buffer_lock = threading.Lock()  # 保护缓冲区的锁
-
-        # 记录元数据
-        self.metadata_buffer = []  # 存储文件名和时间戳等元数据
-
-        print("✓ AES内存加密系统初始化完成")
-
-    def _aes_encrypt_data(self, data):
-        """AES加密数据"""
-        try:
-            # 生成随机IV
-            iv = os.urandom(ScreenshotConfig.AES_IV_SIZE)
-
-            # 创建AES cipher
-            cipher = Cipher(algorithms.AES(self.aes_key), modes.CBC(iv), backend=default_backend())
-            encryptor = cipher.encryptor()
-
-            # PKCS7填充
-            padder = padding.PKCS7(ScreenshotConfig.AES_BLOCK_SIZE).padder()
-            padded_data = padder.update(data) + padder.finalize()
-
-            # 加密
-            encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
-
-            # 返回 IV + 加密数据
-            return iv + encrypted_data
-        except Exception as e:
-            print(f"AES加密失败: {e}")
-            return None
-
-    def _aes_decrypt_data(self, encrypted_data):
-        """AES解密数据"""
-        try:
-            # 提取IV
-            iv = encrypted_data[:ScreenshotConfig.AES_IV_SIZE]
-            actual_encrypted_data = encrypted_data[ScreenshotConfig.AES_IV_SIZE:]
-
-            # 创建AES cipher
-            cipher = Cipher(algorithms.AES(self.aes_key), modes.CBC(iv), backend=default_backend())
-            decryptor = cipher.decryptor()
-
-            # 解密
-            decrypted_padded = decryptor.update(actual_encrypted_data) + decryptor.finalize()
-
-            # 移除PKCS7填充
-            unpadder = padding.PKCS7(ScreenshotConfig.AES_BLOCK_SIZE).unpadder()
-            decrypted_data = unpadder.update(decrypted_padded) + unpadder.finalize()
-
-            return decrypted_data
-        except Exception as e:
-            print(f"AES解密失败: {e}")
-            return None
-
-    def _encrypt_and_store_image(self, img, filename, timestamp):
-        """加密并存储图像到内存缓冲区"""
-        try:
-            # 将PIL图像转换为字节数据
-            from io import BytesIO
-            buffer = BytesIO()
-            img.save(buffer, format='PNG')
-            image_bytes = buffer.getvalue()
-
-            # 加密图像数据
-            encrypted_data = self._aes_encrypt_data(image_bytes)
-
-            if encrypted_data is None:
-                print(f"图像加密失败: {filename}")
-                return False
-
-            # 创建元数据
-            metadata = {
-                'filename': filename,
-                'timestamp': timestamp,
-                'original_size': len(image_bytes),
-                'encrypted_size': len(encrypted_data),
-                'format': 'PNG'
-            }
-
-            # 线程安全地存储到缓冲区
-            with self.buffer_lock:
-                self.encrypted_buffer.append(encrypted_data)
-                self.metadata_buffer.append(metadata)
-
-                # 记录内存使用情况
-                total_memory_usage = sum(len(data) for data in self.encrypted_buffer)
-                print(f"✓ 图像已加密存储到内存 ({len(self.encrypted_buffer)}张, {total_memory_usage/1024:.1f}KB)")
-
-            return True
-
-        except Exception as e:
-            print(f"加密存储失败: {e}")
-            return False
-
-    def _flush_encrypted_buffer_to_disk(self):
-        """将内存中的加密数据统一写入磁盘"""
-        print("正在将加密数据写入磁盘...")
-
-        with self.buffer_lock:
-            if not self.encrypted_buffer:
-                print("内存缓冲区为空，无需写入")
-                return
-
-            success_count = 0
-            fail_count = 0
-
-            for i, (encrypted_data, metadata) in enumerate(zip(self.encrypted_buffer, self.metadata_buffer)):
-                try:
-                    # 解密数据
-                    decrypted_data = self._aes_decrypt_data(encrypted_data)
-                    if decrypted_data is None:
-                        fail_count += 1
-                        continue
-
-                    # 写入文件
-                    filepath = os.path.join(self.save_dir, metadata['filename'])
-                    with open(filepath, 'wb') as f:
-                        f.write(decrypted_data)
-
-                    success_count += 1
-                    print(f"✓ 写入: {metadata['filename']}")
-
-                except Exception as e:
-                    print(f"✗ 写入失败 {metadata['filename']}: {e}")
-                    fail_count += 1
-
-            # 清空缓冲区
-            self.encrypted_buffer.clear()
-            self.metadata_buffer.clear()
-
-            print(f"✓ 批量写入完成: {success_count}成功, {fail_count}失败")
-
-    def _initialize_comprehensive_spoofing(self):
-        """全面过程设置系统 - 尝试所有可用方法"""
-        print("初始化全面过程设置系统...")
-
-        # 1. 窗口标题设置
-        self._spoof_window_title()
-
-        # 2. 进程优先级设置
-        self._spoof_process_priority()
-
-        # 3. 进程名设置 (多种方法)
-        self._spoof_process_name_comprehensive()
-
-        # 4. 进程描述设置
-        self._spoof_process_description()
-
-        # 5. 其他设置增强
-        self._spoof_additional_features()
-
-        print("✓ 全面过程设置系统初始化完成")
-
-        # 预计算截图区域坐标
-        self._precompute_capture_region()
-
-        # 确保保存目录存在
-        if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir)
-
-        # 启动后台截图线程
-        self.screenshot_thread = threading.Thread(target=self._background_capture, daemon=True)
-        self.screenshot_thread.start()
-
-        print("=== 自动截图工具已启动 ===")
-        print(f"保存目录: {self.save_dir}")
-        print("实时截图模式：后台持续截图")
-        print("左键保存截图，左键+Alt忽略")
-        print("保存冷却时间：1秒")
-        print("✓ 全面过程设置系统已激活")
-        print("✓ AES内存加密系统已激活")
-        print("按Ctrl+C退出")
-
-    def _spoof_window_title(self):
-        """窗口标题设置"""
-        try:
-            ctypes.windll.kernel32.SetConsoleTitleW(AppConfig.CONSOLE_TITLE)
-            print("✓ 窗口标题设置成功")
-        except Exception as e:
-            print(f"✗ 窗口标题设置失败: {e}")
-
-    def _spoof_process_priority(self):
-        """进程优先级设置"""
-        try:
-            ctypes.windll.kernel32.SetPriorityClass(
-                ctypes.windll.kernel32.GetCurrentProcess(),
-                ScreenshotConfig.NORMAL_PRIORITY_CLASS,
-            )
-            print("✓ 进程优先级设置成功")
-        except Exception as e:
-            print(f"✗ 进程优先级设置失败: {e}")
-
-    def _spoof_process_name_comprehensive(self):
-        """进程名设置 - 多种方法尝试"""
-        success_count = 0
-
-        # 方法1: NtSetInformationProcess (最有效的方法)
-        try:
-            PROCESS_NAME_WIN32 = ScreenshotConfig.PROCESS_NAME_WIN32
-            PROCESS_NAME_INFORMATION = ctypes.c_wchar_p(ScreenshotConfig.SPOOF_PROCESS_NAME)
-
-            NtSetInformationProcess = ctypes.windll.ntdll.NtSetInformationProcess
-            NtSetInformationProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
-            NtSetInformationProcess.restype = ctypes.c_long
-
-            hProcess = ctypes.windll.kernel32.GetCurrentProcess()
-            status = NtSetInformationProcess(hProcess, PROCESS_NAME_WIN32, ctypes.byref(PROCESS_NAME_INFORMATION), ctypes.sizeof(ctypes.c_wchar_p))
-
-            if status == 0:
-                print("✓ 进程名设置成功 (NtSetInformationProcess)")
-                success_count += 1
-        except Exception as e:
-            print(f"✗ NtSetInformationProcess方法失败: {e}")
-
-        # 方法2: PEB修改 (深层设置)
-        try:
-            self._spoof_via_peb_modification()
-            success_count += 1
-        except Exception as e:
-            print(f"✗ PEB修改方法失败: {e}")
-
-        # 方法3: SetProcessInformation (Windows 10+)
-        try:
-            self._spoof_via_set_process_information()
-            success_count += 1
-        except Exception as e:
-            print(f"✗ SetProcessInformation方法失败: {e}")
-
-        # 方法4: 进程亲和性设置
-        try:
-            self._spoof_via_process_affinity()
-            success_count += 1
-        except Exception as e:
-            print(f"✗ 进程亲和性设置失败: {e}")
-
-        print(f"进程名设置完成，成功方法数: {success_count}")
-
-    def _spoof_via_peb_modification(self):
-        """通过PEB修改进行设置"""
-        # 定义必要的结构
-        class UNICODE_STRING(ctypes.Structure):
-            _fields_ = [
-                ("Length", ctypes.c_ushort),
-                ("MaximumLength", ctypes.c_ushort),
-                ("Buffer", ctypes.c_wchar_p),
-            ]
-
-        class RTL_USER_PROCESS_PARAMETERS(ctypes.Structure):
-            _fields_ = [
-                ("Reserved1", ctypes.c_ubyte * 16),
-                ("Reserved2", ctypes.POINTER(ctypes.c_void_p) * 10),
-                ("ImagePathName", UNICODE_STRING),
-                ("CommandLine", UNICODE_STRING),
-            ]
-
-        class PEB(ctypes.Structure):
-            _fields_ = [
-                ("Reserved1", ctypes.c_ubyte * 2),
-                ("BeingDebugged", ctypes.c_ubyte),
-                ("Reserved2", ctypes.c_ubyte),
-                ("Reserved3", ctypes.POINTER(ctypes.c_void_p)),
-                ("ImageBaseAddress", ctypes.c_void_p),
-                ("Ldr", ctypes.c_void_p),
-                ("ProcessParameters", ctypes.POINTER(RTL_USER_PROCESS_PARAMETERS)),
-            ]
-
-        # 获取PEB
-        peb_addr = ctypes.c_void_p()
-        returned_length = ctypes.c_uint()
-
-        status = ctypes.windll.ntdll.NtQueryInformationProcess(
-            ctypes.windll.kernel32.GetCurrentProcess(),
-            ScreenshotConfig.PROCESS_BASIC_INFORMATION,
-            ctypes.byref(peb_addr),
-            ctypes.sizeof(peb_addr),
-            ctypes.byref(returned_length)
-        )
-
-        if status == 0 and peb_addr.value:
-            peb = ctypes.cast(peb_addr, ctypes.POINTER(PEB)).contents
-            if peb.ProcessParameters:
-                params = peb.ProcessParameters.contents
-                # 创建新的ImagePathName
-                fake_path = ScreenshotConfig.SPOOF_IMAGE_PATH
-                new_unicode = UNICODE_STRING()
-                new_unicode.Length = len(fake_path) * 2
-                new_unicode.MaximumLength = new_unicode.Length + 2
-                new_unicode.Buffer = ctypes.c_wchar_p(fake_path)
-
-                # 修改ImagePathName
-                params.ImagePathName = new_unicode
-                print("✓ PEB进程名设置成功")
-
-    def _spoof_via_set_process_information(self):
-        """通过SetProcessInformation进行设置"""
-        try:
-            # 尝试设置进程显示名称 (Windows 10 1607+)
-            PROCESS_INFORMATION_CLASS = ScreenshotConfig.PROCESS_NAME_INFORMATION_CLASS
-            PROCESS_NAME_INFORMATION = ctypes.c_wchar_p(ScreenshotConfig.SPOOF_PROCESS_NAME)
-
-            SetProcessInformation = ctypes.windll.kernel32.SetProcessInformation
-            SetProcessInformation.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
-            SetProcessInformation.restype = ctypes.c_bool
-
-            hProcess = ctypes.windll.kernel32.GetCurrentProcess()
-            result = SetProcessInformation(hProcess, PROCESS_INFORMATION_CLASS, ctypes.byref(PROCESS_NAME_INFORMATION), ctypes.sizeof(ctypes.c_wchar_p))
-
-            if result:
-                print("✓ SetProcessInformation进程名设置成功")
-        except Exception as e:
-            # 如果失败，可能是因为API不可用，静默跳过
-            pass
-
-    def _spoof_via_process_affinity(self):
-        """通过进程亲和性设置"""
-        try:
-            # 设置进程亲和性，模拟系统进程的行为
-            current_affinity = ctypes.windll.kernel32.GetProcessAffinityMask(
-                ctypes.windll.kernel32.GetCurrentProcess(),
-                None, None
-            )
-            # 不改变亲和性，只是记录操作成功
-            print("✓ 进程亲和性设置成功")
-        except Exception as e:
-            print(f"进程亲和性设置失败: {e}")
-
-    def _spoof_process_description(self):
-        """进程描述设置"""
-        try:
-            # 尝试设置进程描述 (如果可用)
-            # 这个功能在某些Windows版本中可用
-            print(f"✓ 进程描述设置完成: {ScreenshotConfig.PROCESS_DESCRIPTION}")
-        except Exception as e:
-            print(f"✗ 进程描述设置失败: {e}")
-
-    def _spoof_additional_features(self):
-        """其他设置增强功能"""
-        try:
-            # 设置进程的错误模式，模拟系统进程
-            ctypes.windll.kernel32.SetErrorMode(ScreenshotConfig.SEM_NOALIGNMENTFAULTEXCEPT)
-            print("✓ 错误模式设置成功")
-        except Exception as e:
-            print(f"✗ 错误模式设置失败: {e}")
-
-        try:
-            # 设置进程的UI语言，模拟系统进程
-            # 这个通常不需要修改，但作为完整性检查
-            print("✓ UI语言设置完成")
-        except Exception as e:
-            print(f"✗ UI语言设置失败: {e}")
 
     def _precompute_capture_region(self, size=ScreenshotConfig.RAW_CAPTURE_SIZE):
         """预计算截图区域坐标，避免每次重新计算"""
@@ -477,18 +267,19 @@ class ScreenshotCollector:
         return img
 
     def save_image(self, img):
-        """保存图像到内存缓冲区（AES加密）"""
+        """直接保存图像到磁盘（不加密）"""
         timestamp = datetime.now().strftime(ScreenshotConfig.FILENAME_TIMESTAMP_FORMAT)
         filename = ScreenshotConfig.FILENAME_PATTERN.format(
             timestamp=timestamp, index=self.image_count
         )
+        filepath = os.path.join(self.save_dir, filename)
 
-        # 使用AES加密存储到内存缓冲区，而不是直接写入磁盘
-        if self._encrypt_and_store_image(img, filename, timestamp):
+        try:
+            img.save(filepath, format='PNG')
             self.image_count += 1
-            print(f"✓ 截图已加密存储到内存: {filename}")
-        else:
-            print(f"✗ 截图存储失败: {filename}")
+            print(f"✓ 截图已保存: {filename}")
+        except Exception as e:
+            print(f"✗ 截图保存失败 {filename}: {e}")
 
     def play_success_sound(self):
         """播放成功提示音"""
@@ -534,10 +325,10 @@ class ScreenshotCollector:
         except AttributeError:
             pass
 
-    def on_click(self, x, y, button, pressed):
+    def on_click(self, button, pressed):
         """鼠标点击监听回调"""
         try:
-            if button == mouse.Button.left and pressed:
+            if button == 'left' and pressed:
                 # 检查是否按住左Alt键（防误触）
                 if self.left_alt_pressed:
                     return  # 忽略这次点击
@@ -568,11 +359,27 @@ class ScreenshotCollector:
 
     def start(self):
         """启动截图收集器"""
-        print("开始监听...")
+        # 预计算截图区域
+        self._precompute_capture_region()
 
-        # 创建鼠标监听器
-        self.mouse_listener = mouse.Listener(on_click=self.on_click)
-        self.mouse_listener.start()
+        # 确保保存目录存在
+        if not os.path.exists(self.save_dir):
+            os.makedirs(self.save_dir)
+
+        # 启动后台截图线程
+        self.screenshot_thread = threading.Thread(target=self._background_capture, daemon=True)
+        self.screenshot_thread.start()
+
+        print("=== 自动截图工具已启动 ===")
+        print(f"保存目录: {self.save_dir}")
+        print("实时截图模式：后台持续截图")
+        print("左键保存截图，左键+Alt忽略")
+        print("保存冷却时间：1秒")
+        print("✓ 鼠标监听使用 Raw Input 模式")
+        print("按Ctrl+C退出")
+
+        # 创建鼠标监听器（Raw Input 模式，不安装低级钩子）
+        self.mouse_listener = RawInputMouseListener(self.on_click)
 
         # 创建键盘监听器
         self.keyboard_listener = pynput_kb.Listener(
@@ -583,7 +390,7 @@ class ScreenshotCollector:
 
         try:
             # 使用循环代替join，让Ctrl+C更容易中断
-            while self.running and self.mouse_listener.is_alive():
+            while self.running and self.mouse_listener.thread.is_alive():
                 time.sleep(0.1)  # 短暂休眠，避免占用太多CPU
         except KeyboardInterrupt:
             print("\n收到中断信号，正在退出...")
@@ -600,9 +407,6 @@ class ScreenshotCollector:
         self.running = False
         if hasattr(self, 'screenshot_thread'):
             self.screenshot_thread.join(timeout=1.0)
-
-        # 将内存中的加密数据写入磁盘
-        self._flush_encrypted_buffer_to_disk()
 
         kb.unhook_all()
         if hasattr(self, 'mouse_listener'):
@@ -623,16 +427,9 @@ def main():
         collector.start()
     except KeyboardInterrupt:
         print("\n程序被用户中断")
-        # 确保数据被保存
-        collector._flush_encrypted_buffer_to_disk()
         collector.stop()
     except Exception as e:
         print(f"发生错误: {e}")
-        # 即使发生异常也要尝试保存数据
-        try:
-            collector._flush_encrypted_buffer_to_disk()
-        except:
-            pass
         collector.stop()
 
 if __name__ == "__main__":
