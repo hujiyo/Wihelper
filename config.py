@@ -215,7 +215,6 @@ class AppConfig:
     # 按键
     FIRE_KEY = "p"           # 开火键
     INTERRUPT_KEY = "f"      # 打断判断模式
-    INTERRUPT_KEY_CHAR = "f"
 
     # 推理模块
     WARMUP_RUNS = 5

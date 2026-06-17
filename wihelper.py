@@ -23,7 +23,7 @@ import ctypes
 import uuid
 import ctypes.wintypes as wintypes
 import winsound
-from pynput.keyboard import Controller as KeyboardController, Listener as KeyboardListener, Key
+from pynput.keyboard import Controller as KeyboardController
 import gc
 import signal
 from datetime import datetime
@@ -329,6 +329,7 @@ RIDEV_INPUTSINK = 0x00000100
 RIDEV_NOLEGACY = 0x00000030
 RID_INPUT = 0x10000003
 RIM_TYPEMOUSE = 0
+RIM_TYPEKEYBOARD = 1
 
 WM_INPUT = 0x00FF
 
@@ -360,9 +361,20 @@ class RAWMOUSE(ctypes.Structure):
         ("ulExtraInformation", wintypes.ULONG),
     ]
 
+class RAWKEYBOARD(ctypes.Structure):
+    _fields_ = [
+        ("MakeCode", wintypes.USHORT),
+        ("Flags", wintypes.USHORT),
+        ("Reserved", wintypes.USHORT),
+        ("VKey", wintypes.USHORT),
+        ("Message", wintypes.UINT),
+        ("ExtraInformation", wintypes.ULONG),
+    ]
+
 class RAWINPUTUNION(ctypes.Union):
     _fields_ = [
         ("mouse", RAWMOUSE),
+        ("keyboard", RAWKEYBOARD),
     ]
 
 class RAWINPUT(ctypes.Structure):
@@ -484,6 +496,142 @@ class RawInputMouseListener:
             print(f"⚠️ 清理Raw Input资源时出错: {e}")
 
 
+# --- Raw Input 键盘监听器 ---
+class RawInputKeyboardListener:
+    """Raw Input 键盘监听器
+
+    与 RawInputMouseListener 相互独立：各自的窗口、各自的消息循环、各自的 stop 方法。
+    共用 RAWINPUT / RAWINPUTHEADER / RAWINPUTUNION 结构体定义。
+    监听 F 键（VK_F = 0x46）的按下事件。
+    """
+
+    # VK_F 是 Windows 头文件 winuser.h 硬编码的标准虚拟键码
+    VK_F = 0x46
+    # RI_KEY_MAKE (按位与 1 == 0) 表示按下事件；与 E0/E1 前缀标志位并存
+    RI_KEY_BREAK_MASK = 0x01
+    # HID UsagePage/Usage 规范定义：Generic Desktop / Keyboard
+    HID_USAGE_PAGE_GENERIC = 0x01
+    HID_USAGE_KEYBOARD = 0x06
+
+    def __init__(self, on_key_press_callback):
+        self.on_key_press_callback = on_key_press_callback
+        self.running = True
+        self.hwnd = None
+        self.class_atom = None
+        self._self_check_done = False
+        self.thread = threading.Thread(target=self._message_loop, daemon=True)
+        self.thread.start()
+
+    def _message_loop(self):
+        try:
+            wc = win32gui.WNDCLASS()
+            wc.lpfnWndProc = self._wnd_proc
+            wc.lpszClassName = f"RawInputKeyboard_{uuid.uuid4()}"
+            hinst = wc.hInstance = win32gui.GetModuleHandle(None)
+            class_atom = win32gui.RegisterClass(wc)
+            hwnd = win32gui.CreateWindow(class_atom, "RawInputKeyboardHidden", 0, 0, 0, 0, 0, 0, 0, hinst, None)
+
+            if not hwnd:
+                raise RuntimeError("键盘监听窗口创建失败")
+
+            self.hwnd = hwnd
+            self.class_atom = class_atom
+
+            rid = RAWINPUTDEVICE()
+            rid.usUsagePage = self.HID_USAGE_PAGE_GENERIC
+            rid.usUsage = self.HID_USAGE_KEYBOARD
+            rid.dwFlags = RIDEV_INPUTSINK
+            rid.hwndTarget = hwnd
+
+            print(f"🔧 尝试注册键盘 Raw Input 模式1: flags=0x{rid.dwFlags:08X}, hwnd={rid.hwndTarget}")
+
+            if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(rid)):
+                print("⚠️ 模式1失败，尝试模式2: 不指定窗口")
+                rid.hwndTarget = None
+                if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(rid)):
+                    print("⚠️ 模式2失败，尝试模式3: RIDEV_INPUTSINK | RIDEV_NOLEGACY")
+                    rid.dwFlags = RIDEV_INPUTSINK | RIDEV_NOLEGACY
+                    rid.hwndTarget = hwnd
+                    if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(rid)):
+                        print("⚠️ 模式3失败，尝试模式4: 仅RIDEV_NOLEGACY")
+                        rid.dwFlags = RIDEV_NOLEGACY
+                        if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(rid)):
+                            raise RuntimeError("所有键盘 Raw Input 注册模式都失败")
+            print("✅ 键盘 Raw Input 注册成功（按 F 键验证链路）")
+
+            while self.running:
+                win32gui.PumpWaitingMessages()
+                time.sleep(0.005)
+
+        except Exception as e:
+            print(f"❌ 键盘监听器初始化失败: {e}")
+            raise
+        finally:
+            try:
+                if self.hwnd:
+                    win32gui.DestroyWindow(self.hwnd)
+                    self.hwnd = None
+            except Exception as e:
+                print(f"⚠️ 清理键盘窗口资源时出错: {e}")
+
+    def _wnd_proc(self, hwnd, msg, wparam, lparam):
+        if msg == WM_INPUT:
+            self._handle_raw_input(lparam)
+        return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+    def _handle_raw_input(self, lparam):
+        buf = None
+        try:
+            size = wintypes.UINT()
+            user32.GetRawInputData(lparam, RID_INPUT, None, ctypes.byref(size), ctypes.sizeof(RAWINPUTHEADER))
+
+            if size.value == 0:
+                return
+
+            buf = ctypes.create_string_buffer(size.value)
+            result = user32.GetRawInputData(lparam, RID_INPUT, buf, ctypes.byref(size), ctypes.sizeof(RAWINPUTHEADER))
+
+            if result == -1 or result != size.value:
+                return
+
+            raw = ctypes.cast(buf, ctypes.POINTER(RAWINPUT)).contents
+
+            if raw.header.dwType != RIM_TYPEKEYBOARD:
+                return
+
+            kb = raw.data.keyboard
+            is_f_press = kb.VKey == self.VK_F and (kb.Flags & self.RI_KEY_BREAK_MASK) == 0
+
+            # 首次按 F 键时打印一次自检通过，避免静默失败
+            if is_f_press and not self._self_check_done:
+                print(f"⌨️ 收到 F 键 Raw Input 事件 (VKey=0x{kb.VKey:02X}, Flags=0x{kb.Flags:04X})")
+                self._self_check_done = True
+
+            # 仅响应 F 键按下（忽略抬起、忽略 E0/E1 之外的修饰位）
+            if is_f_press:
+                self.on_key_press_callback()
+
+        except Exception as e:
+            print(f"❌ 处理键盘 Raw Input 数据失败: {e}")
+        finally:
+            if buf is not None:
+                del buf
+
+    def stop(self):
+        self.running = False
+        if self.thread.is_alive():
+            self.thread.join(timeout=AppConfig.MOUSE_LISTENER_JOIN_TIMEOUT)
+        try:
+            if self.hwnd:
+                win32gui.DestroyWindow(self.hwnd)
+                self.hwnd = None
+            if self.class_atom:
+                win32gui.UnregisterClass(self.class_atom, None)
+                self.class_atom = None
+        except Exception as e:
+            print(f"⚠️ 清理键盘 Raw Input 资源时出错: {e}")
+
+
 class FeedbackCollector:
     """反馈数据收集器"""
     def __init__(self, save_dir=DataConfig.DATA_DIR):
@@ -528,8 +676,7 @@ class WiHelper:
         self.judging_lock = threading.Lock()
         self.mouse_listener = RawInputMouseListener(self.on_mouse_click)
 
-        self.keyboard_listener = KeyboardListener(on_press=self.on_key_press)
-        self.keyboard_listener.start()
+        self.keyboard_listener = RawInputKeyboardListener(self.on_key_press)
 
         self.fire_cooldown = fire_cooldown
 
@@ -549,14 +696,11 @@ class WiHelper:
 
         self._memory_check_counter = 0
 
-    def on_key_press(self, key):
-        try:
-            if hasattr(key, 'char') and key.char == AppConfig.INTERRUPT_KEY_CHAR:
-                if self.judging_mode:
-                    print("⌨️ F键按下：打断判断模式")
-                    self.f_key_pressed = True
-        except AttributeError:
-            pass
+    def on_key_press(self):
+        # F 键事件已在 RawInputKeyboardListener 内部过滤，这里只关心按下后的业务逻辑
+        if self.judging_mode:
+            print("⌨️ F键按下：打断判断模式")
+            self.f_key_pressed = True
 
     def on_mouse_click(self, button, pressed):
         global if_dead, global_lock
