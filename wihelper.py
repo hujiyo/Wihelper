@@ -88,11 +88,13 @@ if_dead = 0
 current_result = 0
 
 class OptimizedInferenceModule:
-    """ONNX Runtime 推理模块 - 使用 DirectML GPU 加速，CPU 兜底"""
+    """ONNX Runtime 推理模块 - 必须使用 GPU（DirectML / CUDA），禁止 CPU 兜底"""
     def __init__(self, model_path=AppConfig.DEFAULT_ONNX_MODEL_PATH, threshold=AppConfig.DEFAULT_FIRE_THRESHOLD):
         self.model_path = model_path
         self.threshold = threshold
         self.capture_size = AppConfig.CAPTURE_SIZE
+        # FP32 默认；FP16 模型加载后会被 _probe_io 改成 np.float16
+        self._input_dtype = np.float32
 
         # 预分配推理输入 buffer，避免每帧重新分配
         self._input_buf = np.zeros(
@@ -129,34 +131,53 @@ class OptimizedInferenceModule:
         sess_options.intra_op_num_threads = 1
         sess_options.inter_op_num_threads = 1
 
-        # DirectML 优先 → CUDA → CPU 兜底
+        # 必须使用 GPU：DML 优先 → CUDA 次之
         available_providers = ort.get_available_providers()
         providers = []
         if 'DmlExecutionProvider' in available_providers:
             providers.append('DmlExecutionProvider')
         if 'CUDAExecutionProvider' in available_providers:
             providers.append('CUDAExecutionProvider')
-        providers.append('CPUExecutionProvider')
+        if not providers:
+            print("❌ 未检测到任何 GPU 执行提供者 (DML / CUDA)")
+            sys.exit(1)
 
-        try:
-            self.session = ort.InferenceSession(
-                self.model_path, sess_options=sess_options, providers=providers
-            )
-        except Exception as e:
-            print(f"⚠️ GPU 加载失败，回退 CPU: {e}")
-            self.session = ort.InferenceSession(
-                self.model_path, sess_options=sess_options, providers=['CPUExecutionProvider']
-            )
+        self.session = ort.InferenceSession(
+            self.model_path, sess_options=sess_options, providers=providers
+        )
 
         active_provider = self.session.get_providers()[0]
         self._is_gpu = active_provider in ('DmlExecutionProvider', 'CUDAExecutionProvider')
         provider_name = {
             'DmlExecutionProvider': 'DirectML (GPU)',
             'CUDAExecutionProvider': 'CUDA (GPU)',
-            'CPUExecutionProvider': 'CPU',
         }.get(active_provider, active_provider)
 
         print(f"✅ 模型加载完成！执行提供者: {provider_name}")
+
+        # 自动探测：输入 dtype (FP32/FP16)
+        self._probe_io()
+
+    def _probe_io(self):
+        """探测 ONNX 模型的输入 dtype（FP32 / FP16）"""
+        try:
+            import onnx
+            onnx_model = onnx.load(self.model_path)
+            input_type = onnx_model.graph.input[0].type.tensor_type.elem_type
+            # 1 = FLOAT, 10 = FLOAT16
+            if input_type == 10:
+                self._input_dtype = np.float16
+                # 重建 buffer 为 fp16
+                self._input_buf = np.zeros(
+                    (1, 3, AppConfig.CAPTURE_SIZE, AppConfig.CAPTURE_SIZE),
+                    dtype=np.float16,
+                )
+                self._inv_255 = np.float16(1.0 / 255.0)
+                print("   输入精度: FP16（GPU 推理将提速）")
+            else:
+                print("   输入精度: FP32")
+        except Exception as e:
+            print(f"   ⚠️ IO 探测失败: {e}，按默认 FP32 处理")
 
     def _warmup_model(self):
         """预热模型"""
@@ -184,9 +205,9 @@ class OptimizedInferenceModule:
             buf[0] = raw[:, :, 2]  # R
             buf[1] = raw[:, :, 1]  # G
             buf[2] = raw[:, :, 0]  # B
-            # in-place 归一化
+            # in-place 归一化（dtype 自动跟随 buffer：fp16/fp32）
             buf *= self._inv_255
-            # 推理
+            # 推理 + sigmoid → 概率
             logit = self.session.run(None, {ModelConfig.INPUT_NAME: self._input_buf})[0]
             return float(1.0 / (1.0 + np.exp(-logit[0, 0])))
         except Exception as e:
@@ -196,8 +217,8 @@ class OptimizedInferenceModule:
     def predict_from_pil_image(self, pil_image):
         """从 PIL 图像推理（兼容反馈截图等场景）"""
         try:
-            img = np.array(pil_image, dtype=np.float32)
-            img *= self._inv_255
+            img = np.array(pil_image, dtype=self._input_dtype)
+            img *= np.array(self._inv_255, dtype=self._input_dtype)
             buf = self._input_buf[0]
             buf[0] = img[:, :, 0]  # R
             buf[1] = img[:, :, 1]  # G

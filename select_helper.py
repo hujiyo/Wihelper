@@ -78,7 +78,7 @@ class SelectHelper:
             print("  未找到模型文件，跳过模型预测")
             return
 
-        self.device = DeviceConfig.get_device(require_cuda=False)
+        self.device = DeviceConfig.get_device()
         self.model = WiHelperCNN()
         state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(state_dict)

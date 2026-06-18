@@ -34,7 +34,7 @@ def main():
         sys.exit(1)
 
     print(f"加载模型: {model_path}")
-    device = DeviceConfig.get_device(require_cuda=False)
+    device = DeviceConfig.get_device()
     model = WiHelperCNN()
     state_dict = torch.load(model_path, map_location=device, weights_only=True)
     model.load_state_dict(state_dict)

@@ -30,7 +30,7 @@ class WiHelperDetector:
         self.img_height = DataConfig.TARGET_SIDE_LENGTH
         self.img_width = DataConfig.TARGET_SIDE_LENGTH
 
-        self.device = DeviceConfig.get_device(require_cuda=False)
+        self.device = DeviceConfig.get_device()
 
         self.load_model()
 
@@ -443,7 +443,8 @@ def main():
     if torch.cuda.is_available():
         print(f"CUDA 设备: {torch.cuda.get_device_name(0)}")
     else:
-        print("ℹ 未检测到GPU设备，使用CPU推理")
+        print("❌ 未检测到 CUDA 设备，程序退出")
+        sys.exit(1)
 
     import argparse
 

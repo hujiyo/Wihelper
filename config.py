@@ -133,10 +133,6 @@ class TrainingConfig:
     # 梯度累积
     ACCUMULATION_STEPS = 4
 
-    # DataLoader
-    NUM_WORKERS = 0
-    PIN_MEMORY = True  # 训练时启用；CPU 模式下请设 False
-
     # 随机种子
     SEED = 42
 
@@ -289,26 +285,13 @@ class UIConfig:
 
 # ==================== 设备配置 ====================
 class DeviceConfig:
-    """设备选择。训练脚本要求 CUDA；主程序 wihelper.py 允许 CPU 兜底。"""
+    """设备选择。必须使用 GPU（CUDA / DML）"""
     @staticmethod
-    def get_device(require_cuda: bool = False):
-        """
-        获取 PyTorch 设备。
-
-        延迟导入 torch，避免在 ONNX-only 运行路径（wihelper.py、
-        screenshot_collector.py 等仅做 ONNX 推理/截图的脚本）下污染
-        运行环境。
-
-        Args:
-            require_cuda: 若为 True，则在 CUDA 不可用时打印错误并 sys.exit(1)；
-                          若为 False，则在 CUDA 不可用时退回 CPU。
-        """
+    def get_device():
+        # 获取 PyTorch 设备。
         import torch  # 延迟导入，避免污染纯 ONNX 运行路径
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if device.type == "cuda":
-            return device
-        if require_cuda:
-            print("ERROR:CUDA 不可用，程序退出")
-            sys.exit(1)
-        return device
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        print("ERROR:未检测到 CUDA 设备，程序退出")
+        sys.exit(1)

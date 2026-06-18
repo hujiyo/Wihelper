@@ -259,8 +259,7 @@ class WiHelperTrainer:
 
         os.makedirs(model_save_dir, exist_ok=True)
 
-        # 设备（训练要求 CUDA）
-        self.device = DeviceConfig.get_device(require_cuda=True)
+        self.device = DeviceConfig.get_device()
 
         np.random.seed(TrainingConfig.SEED)
         torch.manual_seed(TrainingConfig.SEED)
@@ -347,15 +346,13 @@ class WiHelperTrainer:
             train_dataset,
             batch_size=self.batch_size,
             sampler=sampler,
-            num_workers=TrainingConfig.NUM_WORKERS,
-            pin_memory=TrainingConfig.PIN_MEMORY and torch.cuda.is_available(),
+            pin_memory=torch.cuda.is_available(),
         )
         test_loader = DataLoader(
             test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=TrainingConfig.NUM_WORKERS,
-            pin_memory=TrainingConfig.PIN_MEMORY and torch.cuda.is_available(),
+            pin_memory=torch.cuda.is_available(),
         )
 
         # 注意: ImageFolder 原始映射是 {'got':0, 'nogot':1}
