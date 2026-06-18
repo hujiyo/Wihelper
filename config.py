@@ -125,9 +125,9 @@ class TrainingConfig:
 
     # AdamW 学习率调度（warmup + cosine）
     WARMUP_EPOCHS = 5
-    INITIAL_LR = 1e-4
-    PEAK_LR = 3e-4
-    MIN_LR = 1e-6
+    INITIAL_LR = 1e-4 # 初始学习率
+    PEAK_LR = 3e-4 # 峰值学习率
+    MIN_LR = 3e-6 # 最小学习率
     WEIGHT_DECAY = 0 #浅层模型无需权值衰减
 
     # 梯度累积
@@ -138,8 +138,7 @@ class TrainingConfig:
     PIN_MEMORY = True  # 训练时启用；CPU 模式下请设 False
 
     # 随机种子
-    NP_SEED = 42
-    TORCH_SEED = 42
+    SEED = 42
 
     # 在线增强 (add_noise_and_blur)
     AUG_PROBS = (0.3, 0.3, 0.4)  # noise / blur / none
@@ -159,7 +158,6 @@ class LossConfig:
 # ==================== 推理参数 ====================
 class InferenceConfig:
     """推理/校验/基准测试相关参数（PyTorch 训练/评估侧）"""
-
     # 训练/评估脚本使用的 .pth 模型路径
     DEFAULT_PTH_MODEL_PATH = "models/best_model.pth"
     # 训练/评估的默认分类阈值（评估/标注用 0.5，开火见 AppConfig.DEFAULT_FIRE_THRESHOLD）
@@ -239,7 +237,6 @@ class AppConfig:
 # ==================== 截图收集器参数 ====================
 class ScreenshotConfig:
     """截图收集器 screenshot_collector.py 相关参数"""
-
     # 保存目录：统一引用 PathsConfig.DATA_ROOT
     SAVE_DIR = PathsConfig.DATA_ROOT
     SAVE_COOLDOWN = 0.2          # 秒

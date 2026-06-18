@@ -262,10 +262,10 @@ class WiHelperTrainer:
         # 设备（训练要求 CUDA）
         self.device = DeviceConfig.get_device(require_cuda=True)
 
-        np.random.seed(TrainingConfig.NP_SEED)
-        torch.manual_seed(TrainingConfig.TORCH_SEED)
+        np.random.seed(TrainingConfig.SEED)
+        torch.manual_seed(TrainingConfig.SEED)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed(TrainingConfig.TORCH_SEED)
+            torch.cuda.manual_seed(TrainingConfig.SEED)
 
     def create_model(self):
         print("\n" + "=" * 40)
