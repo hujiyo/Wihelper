@@ -8,6 +8,7 @@ WiHelper - 激光射蚊子助手
 
 import os
 import sys
+import math
 
 # 在 numpy 导入前设置，避免 MKL 多线程 DLL 缺失导致崩溃
 os.environ.setdefault('MKL_THREADING_LAYER', 'SEQUENTIAL')
@@ -92,6 +93,8 @@ class OptimizedInferenceModule:
     def __init__(self, model_path=AppConfig.DEFAULT_ONNX_MODEL_PATH, threshold=AppConfig.DEFAULT_FIRE_THRESHOLD):
         self.model_path = model_path
         self.threshold = threshold
+        # 预计算 logit 阈值：sigmoid 是单调函数，比较可在原始输出空间完成
+        self._logit_threshold = math.log(threshold / (1.0 - threshold))
         self.capture_size = AppConfig.CAPTURE_SIZE
         # FP32 默认；FP16 模型加载后会被 _probe_io 改成 np.float16
         self._input_dtype = np.float32
@@ -196,8 +199,20 @@ class OptimizedInferenceModule:
             print(f"⚠️ 预热出错: {e}")
         print("✓ 模型预热完成")
 
+    @staticmethod
+    def _stable_sigmoid_fp32(z):
+        """数值稳定的 sigmoid（输入已确保是 FP32 标量）。python math.exp 内部就是 fp64，更安全。"""
+        if z >= 0:
+            return 1.0 / (1.0 + math.exp(-z))
+        ez = math.exp(z)
+        return ez / (1.0 + ez)
+
     def predict_from_raw_bgra(self, bgra_bytes, width, height):
-        """从 mss 截图的原始 BGRA 字节直接推理（零 PIL，零中间数组）"""
+        """从 mss 截图的原始 BGRA 字节直接推理（零 PIL，零中间数组）
+
+        热路径：直接返回原始 logit，调用方通过与 self._logit_threshold 比较做判定，
+        不再每帧算 sigmoid，既省一次 exp/除法，也彻底消除 fp16 下的 exp 溢出警告。
+        """
         try:
             raw = np.frombuffer(bgra_bytes, dtype=np.uint8).reshape(height, width, 4)
             buf = self._input_buf[0]  # shape (3, H, W)
@@ -207,15 +222,17 @@ class OptimizedInferenceModule:
             buf[2] = raw[:, :, 0]  # B
             # in-place 归一化（dtype 自动跟随 buffer：fp16/fp32）
             buf *= self._inv_255
-            # 推理 + sigmoid → 概率
             logit = self.session.run(None, {ModelConfig.INPUT_NAME: self._input_buf})[0]
-            return float(1.0 / (1.0 + np.exp(-logit[0, 0])))
+            return float(logit[0, 0])
         except Exception as e:
             print(f"❌ 推理失败: {e}")
-            return 0.0
+            return float('-inf')  # 异常时返回极小 logit，确保判定为不触发
 
     def predict_from_pil_image(self, pil_image):
-        """从 PIL 图像推理（兼容反馈截图等场景）"""
+        """从 PIL 图像推理（兼容反馈截图等场景）
+
+        冷路径：先取 logit，显式转 FP32 再走稳定 sigmoid（避免 fp16 下 exp 溢出）。
+        """
         try:
             img = np.array(pil_image, dtype=self._input_dtype)
             img *= np.array(self._inv_255, dtype=self._input_dtype)
@@ -224,7 +241,9 @@ class OptimizedInferenceModule:
             buf[1] = img[:, :, 1]  # G
             buf[2] = img[:, :, 2]  # B
             logit = self.session.run(None, {ModelConfig.INPUT_NAME: self._input_buf})[0]
-            return float(1.0 / (1.0 + np.exp(-logit[0, 0])))
+            # 关键：显式升 FP32，再做 sigmoid
+            z = float(np.asarray(logit[0, 0], dtype=np.float32))
+            return self._stable_sigmoid_fp32(z)
         except Exception as e:
             print(f"❌ 推理失败: {e}")
             return 0.0
@@ -284,7 +303,7 @@ class ScreenshotInferenceThread(threading.Thread):
                 try:
                     screenshot = sct.grab(self.capture_region)
 
-                    probability = self.inference_module.predict_from_raw_bgra(
+                    logit = self.inference_module.predict_from_raw_bgra(
                         screenshot.bgra, screenshot.width, screenshot.height
                     )
 
@@ -298,14 +317,10 @@ class ScreenshotInferenceThread(threading.Thread):
 
                     global if_exit_goal, current_result
                     with global_lock:
-                        old_value = if_exit_goal
-                        old_current = current_result
-
-                        current_result = 1 if probability > self.inference_module.threshold else 0
-                        if_exit_goal = 1 if probability > self.inference_module.threshold else 0
-
-                    if if_exit_goal != old_value or current_result != old_current:
-                        print(f"🎯 推理结果更新: 概率={probability:.3f}, current={current_result}, if_exit_goal={if_exit_goal}")
+                        # 直接在 logit 空间比较，跳过 sigmoid（热路径优化）
+                        fired = 1 if logit > self.inference_module._logit_threshold else 0
+                        current_result = fired
+                        if_exit_goal = fired
 
                     # 帧率限制：等待剩余时间
                     elapsed = time.perf_counter() - frame_start

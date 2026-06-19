@@ -53,7 +53,6 @@ class WiHelperDetector:
             self.model.load_state_dict(state_dict)
             self.model.to(self.device)
             self.model.eval()
-            print("✅ 模型加载成功！")
             print(f"   设备: {self.device}")
 
             print("\n模型信息:")
@@ -405,23 +404,16 @@ class WiHelperDetector:
         print(f"平均FPS: {avg_fps:.2f}")
 
         print("\n性能评估:")
-        if avg_fps >= 100:
+        if avg_fps >= 800:
             print("   性能等级: ⭐⭐⭐⭐⭐ 极高")
-        elif avg_fps >= 50:
+        elif avg_fps >= 600:
             print("   性能等级: ⭐⭐⭐⭐ 高")
-        elif avg_fps >= 20:
+        elif avg_fps >= 400:
             print("   性能等级: ⭐⭐⭐ 中等")
-        elif avg_fps >= 10:
+        elif avg_fps >= 100:
             print("   性能等级: ⭐⭐ 较低")
         else:
             print("   性能等级: ⭐ 很低")
-
-        if avg_time > 50:
-            print("   💡 建议: 推理时间较长，考虑优化模型或使用GPU")
-        elif avg_time > 20:
-            print("   💡 建议: 推理时间适中，可接受")
-        else:
-            print("   ✅ 推理性能优秀！")
 
         return {
             'avg_time_ms': avg_time,
