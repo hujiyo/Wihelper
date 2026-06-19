@@ -723,6 +723,7 @@ class WiHelper:
         self.screenshot_thread.start()
 
         self.feedback_collector = FeedbackCollector()
+        self._keyboard = KeyboardController()
 
         try:
             ctypes.windll.kernel32.SetConsoleTitleW(AppConfig.CONSOLE_TITLE)
@@ -861,7 +862,6 @@ class WiHelper:
             print("🏁 退出判断模式")
 
     def fire_laser(self):
-        keyboard = None
         try:
             if self.fire_cooldown >= AppConfig.SNIPER_COOLDOWN_THRESHOLD:
                 current_screenshot = self.screenshot_thread.get_current_screenshot()
@@ -872,16 +872,12 @@ class WiHelper:
                 else:
                     print("⚠️ 无法获取当前截图，跳过反馈数据收集")
 
-            keyboard = KeyboardController()
-            keyboard.press(AppConfig.FIRE_KEY)
-            keyboard.release(AppConfig.FIRE_KEY)
+            self._keyboard.press(AppConfig.FIRE_KEY)
+            self._keyboard.release(AppConfig.FIRE_KEY)
             print("💥 激光发射成功！")
 
         except Exception as e:
             print(f"❌ 开火失败: {e}")
-        finally:
-            if keyboard is not None:
-                del keyboard
 
     def play_fire_sound(self):
         try:
